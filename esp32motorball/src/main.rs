@@ -1,56 +1,43 @@
 #![no_std]
 #![no_main]
 
-use esp_println::println;
+mod hardware_initialisation;
+mod hardware_inputs;
+mod led_driver;
+mod motor_driver;
+mod wifi_connection;
+mod wifi_inputs;
 
-const SSID: &str = "";
-const PASSWORD: &str = "";
+use panic_halt as _;
 
-#[esp_rtos::main]
-async fn main(_spawner: Spawner) -> ! {
-    println!("Creating config");
+use crate::hardware_initialisation::initialise_hardware;
+use crate::hardware_inputs::read_tilt_sensor;
+use crate::led_driver::drive_led;
+use crate::motor_driver::drive_motors;
+use crate::wifi_connection::connect_wifi;
+use crate::wifi_inputs::poll_server;
 
-    let config = esp_hal::Config::default()
-        .with_cpu_clock(CpuClock::max());
+#[unsafe(no_mangle)]
+pub extern "C" fn call_user_start() -> ! {
+    run()
+}
 
-    let peripherals = esp_hal:: init(config);
-    const HEAP_SIZE: usize = 72 * 1024;
-    esp_alloc::heap_allocator!(size: HEAP_SIZE);
-
-    let timer_timg0 = TimerGroup::new(peripherals.TIMG0);
-    let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-
-    esp_rtos::start(timer_timg0.timer0, sw_int.software_interrupt0);
-    
-    let station_builder = StationConfig::default()
-        .with_ssid(SSID)
-        .with_password(PASSWORD.into())
-        .with_auth_method(AuthenticationMethod::None);
-
-    let station_config: Config::Station(station_builder);
-
-    println!("Starting WIFI driver");
-    let controller_config = ControllerConfig::default()
-        .with_initial_config(station_config);
-
-    let mut maybe_controller = WifiController::new(peripherals.WIFI, controller_config);
-    let controller = maybe_controller.unwrap();
-
-
-    println!("WIFI driver started");
+fn run() -> ! {
+    let controller = initialise_hardware().unwrap();
+    let _controller = connect_wifi(controller).unwrap();
 
     loop {
-        println!("connecting");
-        let maybe_connection = controller.connect_async().await;
-        
-        match maybe_connection {
-            Ok(info) => {
-                println!("Connected to WIFI");
-            },
-            Err(e) => {
-                panic!("Failed to connect to WIFI: {:?}", e);
-            }
-        }
-        Timer::after(Duration::from_millis(5000)).await;
+        let server_result = poll_server();
+        let tilt = read_tilt_sensor();
+        drive_motors(server_result.motor_action, tilt);
+        drive_led(server_result.led_action);
+        delay_ms(5000);
+    }
+}
+
+fn delay_ms(ms: u32) {
+    let iterations = ms.saturating_mul(10_000);
+    for _ in 0..iterations {
+        core::hint::spin_loop();
     }
 }
