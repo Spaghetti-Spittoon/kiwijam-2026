@@ -1,5 +1,5 @@
 [package]
-name = "esp32motorball"
+name = "esp8266motorball"
 version = "0.1.0"
 edition = "2024"
 resolver = "2"
