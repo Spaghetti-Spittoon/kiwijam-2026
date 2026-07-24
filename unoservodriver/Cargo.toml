@@ -1,6 +1,24 @@
 [package]
 name = "unoservodriver"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+panic-halt = "1.0"
+
+[dependencies.arduino-hal]
+git = "https://github.com/Rahix/avr-hal"
+features = ["arduino-uno"]
+
+# AVR needs optimization (unoptimized code is huge and breaks cycle-based delays)
+# and panic = "abort" (no unwinding on AVR).
+[profile.dev]
+panic = "abort"
+opt-level = "s"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+debug = true
+lto = true
+opt-level = "s"

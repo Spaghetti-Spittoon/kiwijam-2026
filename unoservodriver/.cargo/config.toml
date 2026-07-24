@@ -1,0 +1,11 @@
+[build]
+target = "avr-none"
+rustflags = ["-C", "target-cpu=atmega328p"]
+
+[unstable]
+build-std = ["core"]
+
+# For flashing a real board: `cargo run` -> ravedude auto-detects the port.
+# (Not needed for Wokwi simulation, which loads the ELF directly.)
+[target.avr-none]
+runner = "ravedude uno"
