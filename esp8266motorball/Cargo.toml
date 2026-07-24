@@ -1,0 +1,25 @@
+[package]
+name = "esp8266motorball"
+version = "0.1.0"
+edition = "2024"
+resolver = "2"
+
+[dependencies]
+esp8266 = "0.6.0"
+panic-halt = "1"
+nb = "1"
+
+
+[profile.dev]
+opt-level = "s"
+panic = "abort"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+debug-assertions = false
+incremental = false
+lto = "fat"
+opt-level = "s"
+overflow-checks = false
+panic = "abort"
