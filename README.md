@@ -12,8 +12,17 @@ espup install
 
 Every time you open a terminal, run `. /home/USER_NAME/export-esp.sh`.
 
+To flash the MCU:
+
 ```
 cargo build --release
 cargo install espflash
 espflash flash target/xtensa-esp8266-none-elf/debug/esp8266motorball
+```
+
+To just run the device with the latest firmware:
+
+```
+sudo chmod 666 /dev/ttyUSB0
+cargo run
 ```
