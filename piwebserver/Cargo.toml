@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 actix-web = "4.14.0"
 serde = { version = "1", features = ["derive"] }
+# Reads the Xbox controller directly on the (headless) Pi via evdev; also works
+# on Windows (XInput) for local testing.
+gilrs = "0.11"

@@ -21,10 +21,14 @@
 use std::sync::Mutex;
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
+use gilrs::{Axis, Gilrs};
 use serde::{Deserialize, Serialize};
 
 /// How strongly a control tugs the opposing player's axis the opposite way.
 const ENTANGLE: f32 = 0.15;
+
+/// Ignore small resting-stick drift near centre.
+const DEADZONE: f32 = 0.12;
 
 /// Whether the motorball should run. Mirrors esp8266motorball's MotorAction.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,9 +46,16 @@ impl MotorAction {
     }
 }
 
-/// Latest X-axis (-1.0..=1.0) for each of the two players.
-#[derive(Clone, Copy, Serialize)]
+/// Latest RAW X-axis (-1.0..=1.0) per player, before entanglement.
+#[derive(Clone, Copy)]
 struct Controls {
+    p1: f32,
+    p2: f32,
+}
+
+/// Entangled X-axis output served to clients/devices.
+#[derive(Serialize)]
+struct ControlsOut {
     p1: f32,
     p2: f32,
 }
@@ -68,8 +79,17 @@ fn clamp_axis(v: f32) -> f32 {
     if v.is_nan() { 0.0 } else { v.clamp(-1.0, 1.0) }
 }
 
-/// Store a player's X-axis and entangle the opponent's axis in the opposite
-/// direction of this control's value.
+/// Quantum Entanglement: each player's served axis is nudged in the opposite
+/// direction of the opponent's raw value. Derived from the raw inputs (not
+/// stored) so a continuous 50 Hz controller stream doesn't compound the nudge.
+fn entangled(raw: Controls) -> ControlsOut {
+    ControlsOut {
+        p1: clamp_axis(raw.p1 - ENTANGLE * raw.p2),
+        p2: clamp_axis(raw.p2 - ENTANGLE * raw.p1),
+    }
+}
+
+/// Store a player's RAW X-axis; entanglement is applied when the data is read.
 #[post("/input/{player}")]
 async fn set_input(
     path: web::Path<String>,
@@ -79,24 +99,18 @@ async fn set_input(
     let x = clamp_axis(body.x);
     let mut c = data.controls.lock().unwrap();
     match path.into_inner().as_str() {
-        "p1" => {
-            c.p1 = x;
-            c.p2 = clamp_axis(c.p2 - ENTANGLE * x);
-        }
-        "p2" => {
-            c.p2 = x;
-            c.p1 = clamp_axis(c.p1 - ENTANGLE * x);
-        }
+        "p1" => c.p1 = x,
+        "p2" => c.p2 = x,
         _ => return HttpResponse::BadRequest().body("unknown player (use p1|p2)"),
     }
-    HttpResponse::Ok().json(*c)
+    HttpResponse::Ok().json(entangled(*c))
 }
 
 /// Controller data the device polls (instead of receiving TTL).
 #[get("/api/controls")]
 async fn api_controls(data: web::Data<AppState>) -> impl Responder {
-    let c = *data.controls.lock().unwrap();
-    web::Json(c)
+    let raw = *data.controls.lock().unwrap();
+    web::Json(entangled(raw))
 }
 
 /// Whether the motorball should run or stop.
@@ -125,6 +139,45 @@ async fn set_motor(path: web::Path<String>, data: web::Data<AppState>) -> impl R
         }
         None => HttpResponse::BadRequest().body("unknown motor action (use start|stop)"),
     }
+}
+
+fn deadzone(x: f32) -> f32 {
+    if x.abs() < DEADZONE { 0.0 } else { x }
+}
+
+/// Background thread: read the Xbox controller(s) on the (headless) Pi and feed
+/// their X-axis into shared state. Left stick of the first pad -> P1, right
+/// stick -> P2; a second connected pad's left stick overrides P2. No screen or
+/// browser required. If no input subsystem is available it logs and exits so
+/// the HTTP `/input` endpoints still work.
+fn spawn_gamepad_reader(state: web::Data<AppState>) {
+    std::thread::spawn(move || {
+        let mut gilrs = match Gilrs::new() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("gamepad: input unavailable ({e}); controller reading disabled");
+                return;
+            }
+        };
+        eprintln!("gamepad: reader started (waiting for a controller)");
+        loop {
+            // Pump events so `value()` reflects the latest stick positions.
+            while gilrs.next_event().is_some() {}
+
+            let pads: Vec<_> = gilrs.gamepads().collect();
+            if let Some((_, pad0)) = pads.first() {
+                let p1 = deadzone(pad0.value(Axis::LeftStickX));
+                let p2 = match pads.get(1) {
+                    Some((_, pad1)) => deadzone(pad1.value(Axis::LeftStickX)),
+                    None => deadzone(pad0.value(Axis::RightStickX)),
+                };
+                let mut c = state.controls.lock().unwrap();
+                c.p1 = clamp_axis(p1);
+                c.p2 = clamp_axis(p2);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
 }
 
 /// Client page: captures input and shows the live state.
@@ -226,6 +279,9 @@ async fn main() -> std::io::Result<()> {
         motor: Mutex::new(MotorAction::Stop),
         controls: Mutex::new(Controls { p1: 0.0, p2: 0.0 }),
     });
+
+    // Read the physical Xbox controller on the (headless) Pi.
+    spawn_gamepad_reader(state.clone());
 
     let addr = ("0.0.0.0", 8080);
     println!("piwebserver: control panel  http://localhost:{}/", addr.1);
