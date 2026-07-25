@@ -1,20 +1,32 @@
-//! Raspberry Pi web server (actix-web) — motor start/stop dashboard.
+//! Raspberry Pi sensor-input web server (actix-web) — issue #20.
 //!
-//! Shows whether the motor should START or STOP, lets you toggle it, and
-//! exposes a JSON endpoint the device can poll.
+//! Reads controller / mouse X-axis input from a browser client, stores the
+//! latest value per player in memory, applies "Quantum Entanglement" (a control
+//! nudges the opposing player's axis the opposite way), and serves the result
+//! over HTTP.
 //!
-//! The `MotorAction` enum below intentionally mirrors the one in the
-//! `esp8266motorball` firmware (`wifi_inputs.rs`), whose `poll_server()` fetches
-//! a `ServerResult`. The branches are kept separate on purpose (not merged), so
-//! this copy is the web-side source of truth for the same contract:
-//! `GET /api/motor` -> `{"motor":"start"|"stop"}`.
+//! We deliberately do NOT send TTL signals to the Arduino Uno. Instead the web
+//! server *is* the controller-data source: consumers poll the API.
+//!
+//! Endpoints:
+//!   GET  /                   -> client page: captures mouse + Gamepad X, live view
+//!   POST /input/{p1|p2}      -> body {"x": -1.0..1.0}; store + entangle opponent
+//!   GET  /api/controls       -> {"p1": x, "p2": x}   (replaces TTL-to-Uno)
+//!   GET  /api/motor          -> {"motor": "start"|"stop"}
+//!   POST /motor/{start|stop} -> set run/stop
+//!
+//! `MotorAction` mirrors `esp8266motorball::wifi_inputs::MotorAction` (the ESP's
+//! `poll_server()` contract), kept in sync by hand — branches aren't merged.
 
 use std::sync::Mutex;
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-/// Whether the motor should run. Mirrors `esp8266motorball::wifi_inputs::MotorAction`.
+/// How strongly a control tugs the opposing player's axis the opposite way.
+const ENTANGLE: f32 = 0.15;
+
+/// Whether the motorball should run. Mirrors esp8266motorball's MotorAction.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MotorAction {
     Stop,
@@ -30,27 +42,64 @@ impl MotorAction {
     }
 }
 
-/// Shared, thread-safe server state.
-struct AppState {
-    motor: Mutex<MotorAction>,
+/// Latest X-axis (-1.0..=1.0) for each of the two players.
+#[derive(Clone, Copy, Serialize)]
+struct Controls {
+    p1: f32,
+    p2: f32,
 }
 
-/// JSON payload for `GET /api/motor` — what the ESP polls.
+struct AppState {
+    motor: Mutex<MotorAction>,
+    controls: Mutex<Controls>,
+}
+
+#[derive(Deserialize)]
+struct AxisInput {
+    x: f32,
+}
+
 #[derive(Serialize)]
 struct MotorStatus {
     motor: &'static str,
 }
 
-/// Status dashboard.
-#[get("/")]
-async fn index(data: web::Data<AppState>) -> impl Responder {
-    let action = *data.motor.lock().unwrap();
-    HttpResponse::Ok()
-        .content_type("text/html; charset=utf-8")
-        .body(render_page(action))
+fn clamp_axis(v: f32) -> f32 {
+    if v.is_nan() { 0.0 } else { v.clamp(-1.0, 1.0) }
 }
 
-/// Machine-readable status the device polls.
+/// Store a player's X-axis and entangle the opponent's axis in the opposite
+/// direction of this control's value.
+#[post("/input/{player}")]
+async fn set_input(
+    path: web::Path<String>,
+    body: web::Json<AxisInput>,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    let x = clamp_axis(body.x);
+    let mut c = data.controls.lock().unwrap();
+    match path.into_inner().as_str() {
+        "p1" => {
+            c.p1 = x;
+            c.p2 = clamp_axis(c.p2 - ENTANGLE * x);
+        }
+        "p2" => {
+            c.p2 = x;
+            c.p1 = clamp_axis(c.p1 - ENTANGLE * x);
+        }
+        _ => return HttpResponse::BadRequest().body("unknown player (use p1|p2)"),
+    }
+    HttpResponse::Ok().json(*c)
+}
+
+/// Controller data the device polls (instead of receiving TTL).
+#[get("/api/controls")]
+async fn api_controls(data: web::Data<AppState>) -> impl Responder {
+    let c = *data.controls.lock().unwrap();
+    web::Json(c)
+}
+
+/// Whether the motorball should run or stop.
 #[get("/api/motor")]
 async fn api_motor(data: web::Data<AppState>) -> impl Responder {
     let action = *data.motor.lock().unwrap();
@@ -59,7 +108,7 @@ async fn api_motor(data: web::Data<AppState>) -> impl Responder {
     })
 }
 
-/// Set the motor state, then return to the dashboard.
+/// Set run/stop.
 #[post("/motor/{action}")]
 async fn set_motor(path: web::Path<String>, data: web::Data<AppState>) -> impl Responder {
     let new = match path.into_inner().as_str() {
@@ -70,77 +119,125 @@ async fn set_motor(path: web::Path<String>, data: web::Data<AppState>) -> impl R
     match new {
         Some(action) => {
             *data.motor.lock().unwrap() = action;
-            // 303 -> browser re-GETs the dashboard.
-            HttpResponse::SeeOther()
-                .insert_header(("Location", "/"))
-                .finish()
+            HttpResponse::Ok().json(MotorStatus {
+                motor: action.as_str(),
+            })
         }
         None => HttpResponse::BadRequest().body("unknown motor action (use start|stop)"),
     }
 }
 
-fn render_page(action: MotorAction) -> String {
-    let (label, accent, disabled_start, disabled_stop) = match action {
-        MotorAction::Start => ("START", "#0aa06e", "disabled", ""),
-        MotorAction::Stop => ("STOP", "#c0392b", "", "disabled"),
-    };
-    format!(
-        r##"<!doctype html>
+/// Client page: captures input and shows the live state.
+#[get("/")]
+async fn index() -> impl Responder {
+    HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(PAGE)
+}
+
+const PAGE: &str = r##"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="3">
-  <title>Motor Control</title>
+  <title>Motorball Control</title>
   <style>
-    :root {{ color-scheme: light dark; }}
-    body {{ font-family: system-ui, sans-serif; margin: 0; min-height: 100vh;
-            display: grid; place-items: center; background: #11151c; color: #e6e6e6; }}
-    .card {{ background: #1b2029; padding: 2.5rem 3rem; border-radius: 16px;
-             box-shadow: 0 10px 40px rgba(0,0,0,.4); text-align: center; min-width: 280px; }}
-    h1 {{ font-size: .95rem; letter-spacing: .15em; text-transform: uppercase;
-          color: #8a93a6; margin: 0 0 1rem; }}
-    .state {{ font-size: 3.2rem; font-weight: 800; letter-spacing: .05em;
-              color: {accent}; margin: .2rem 0 1.6rem; }}
-    .dot {{ display:inline-block; width:.7em; height:.7em; border-radius:50%;
-            background:{accent}; margin-right:.4em; vertical-align:middle;
-            box-shadow:0 0 12px {accent}; }}
-    form {{ display: inline; }}
-    button {{ font: inherit; font-weight: 600; padding: .6rem 1.4rem; margin: 0 .3rem;
-              border: 0; border-radius: 10px; cursor: pointer; color: #fff; }}
-    .start {{ background: #0aa06e; }} .stop {{ background: #c0392b; }}
-    button[disabled] {{ opacity: .35; cursor: default; }}
-    .api {{ margin-top: 1.6rem; font-size: .8rem; color: #6b7280; }}
-    a {{ color: #7aa2f7; }}
+    :root { color-scheme: dark; }
+    body { font-family: system-ui, sans-serif; margin: 0; min-height: 100vh; background: #11151c;
+           color: #e6e6e6; display: grid; place-items: center; }
+    .wrap { width: min(92vw, 560px); }
+    h1 { font-size: 1rem; letter-spacing: .12em; text-transform: uppercase; color: #8a93a6; text-align: center; }
+    .pill { display: inline-block; padding: .3rem 1rem; border-radius: 999px; font-weight: 700; letter-spacing: .05em; }
+    .pill.start { background: #0aa06e; } .pill.stop { background: #c0392b; }
+    .status { text-align: center; margin-bottom: 1.4rem; }
+    .player { margin: 1rem 0; }
+    .player .label { display: flex; justify-content: space-between; font-size: .85rem; color: #9aa4b8; margin-bottom: .35rem; }
+    .track { position: relative; height: 14px; background: #1b2029; border-radius: 8px; }
+    .track .center { position: absolute; left: 50%; top: -4px; bottom: -4px; width: 2px; background: #333c4d; }
+    .fill { position: absolute; top: 0; bottom: 0; width: 14px; margin-left: -7px; border-radius: 7px;
+            background: #7aa2f7; box-shadow: 0 0 10px #7aa2f7; transition: left .08s linear; left: 50%; }
+    .p2 .fill { background: #f7768e; box-shadow: 0 0 10px #f7768e; }
+    button { font: inherit; font-weight: 600; padding: .5rem 1.2rem; margin: .2rem; border: 0; border-radius: 10px;
+             cursor: pointer; color: #fff; } .start { background: #0aa06e; } .stop { background: #c0392b; }
+    .hint { text-align: center; color: #6b7280; font-size: .8rem; margin-top: 1rem; }
+    a { color: #7aa2f7; }
   </style>
 </head>
 <body>
-  <div class="card">
-    <h1>Motor should</h1>
-    <div class="state"><span class="dot"></span>{label}</div>
-    <form method="post" action="/motor/start"><button class="start" {disabled_start}>Start</button></form>
-    <form method="post" action="/motor/stop"><button class="stop" {disabled_stop}>Stop</button></form>
-    <div class="api">device polls <a href="/api/motor">/api/motor</a></div>
+  <div class="wrap">
+    <h1>Motorball Control</h1>
+    <div class="status">
+      motor should <span id="motor" class="pill stop">STOP</span><br><br>
+      <button class="start" onclick="motor('start')">Start</button>
+      <button class="stop" onclick="motor('stop')">Stop</button>
+    </div>
+    <div class="player p1">
+      <div class="label"><span>Player 1 &nbsp;(mouse X)</span><span id="p1-val">0.00</span></div>
+      <div class="track"><div class="center"></div><div id="p1-fill" class="fill"></div></div>
+    </div>
+    <div class="player p2">
+      <div class="label"><span>Player 2 &nbsp;(gamepad axis 0)</span><span id="p2-val">0.00</span></div>
+      <div class="track"><div class="center"></div><div id="p2-fill" class="fill"></div></div>
+    </div>
+    <div class="hint">Move the mouse to drive P1. Connect a gamepad for P2. Quantum entanglement
+      tugs the opponent the opposite way. Data at <a href="/api/controls">/api/controls</a>.</div>
   </div>
-</body>
-</html>"##
-    )
+<script>
+const throttle = {};
+function post(player, x) {
+  const now = performance.now();
+  if (now - (throttle[player] || 0) < 60) return;   // cap ~16 posts/sec/player
+  throttle[player] = now;
+  fetch('/input/' + player, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ x })
+  }).catch(() => {});
 }
+addEventListener('mousemove', e => post('p1', (e.clientX / innerWidth) * 2 - 1));
+function pollPads() {
+  const pads = (navigator.getGamepads && navigator.getGamepads()) || [];
+  if (pads[0]) post('p2', pads[0].axes[0] || 0);
+  requestAnimationFrame(pollPads);
+}
+pollPads();
+function setBar(id, x) {
+  document.getElementById(id + '-fill').style.left = ((x + 1) / 2 * 100) + '%';
+  document.getElementById(id + '-val').textContent = x.toFixed(2);
+}
+async function refresh() {
+  try {
+    const c = await (await fetch('/api/controls')).json();
+    const m = await (await fetch('/api/motor')).json();
+    setBar('p1', c.p1); setBar('p2', c.p2);
+    const el = document.getElementById('motor');
+    el.textContent = m.motor.toUpperCase();
+    el.className = 'pill ' + m.motor;
+  } catch (e) {}
+}
+setInterval(refresh, 150);
+function motor(a) { fetch('/motor/' + a, { method: 'POST' }).catch(() => {}); }
+</script>
+</body>
+</html>"##;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let state = web::Data::new(AppState {
         motor: Mutex::new(MotorAction::Stop),
+        controls: Mutex::new(Controls { p1: 0.0, p2: 0.0 }),
     });
 
     let addr = ("0.0.0.0", 8080);
-    println!("piwebserver: motor dashboard on http://localhost:{}/", addr.1);
-    println!("             JSON status at   http://localhost:{}/api/motor", addr.1);
+    println!("piwebserver: control panel  http://localhost:{}/", addr.1);
+    println!("             controls API   http://localhost:{}/api/controls", addr.1);
+    println!("             motor API      http://localhost:{}/api/motor", addr.1);
 
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
             .service(index)
+            .service(set_input)
+            .service(api_controls)
             .service(api_motor)
             .service(set_motor)
     })
