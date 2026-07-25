@@ -1,29 +1,34 @@
 //! Arduino Uno servo driver — AVR firmware for Wokwi and a real Uno.
 //!
-//! Timer1 produces a hardware-timed 50 Hz hobby-servo signal on D9.  The Pi
-//! sends TTL-level, servo-style PWM to D2: 1000 µs means 0°, 1500 µs means
-//! centre, and 2000 µs means 180°.  D2/INT0 measures the input in an interrupt,
-//! independently of the D9 output waveform.
+//! Timer1 produces hardware-timed 50 Hz hobby-servo signals for both players.
+//! The Pi sends independent TTL-level, servo-style PWM controls: D2/INT0 drives
+//! the Player 1 servo on D9/OC1A, while D3/INT1 drives the Player 2 servo on
+//! D10/OC1B.  For both channels, 1000 µs means 0°, 1500 µs means centre, and
+//! 2000 µs means 180°.
 //!
 //! # Pi-to-Uno wiring and protocol
 //!
-//! - Pi GPIO (PWM output) -> level shifter/buffer -> Uno D2.  Emit one positive
-//!   pulse every 20 ms (50 Hz), with a width from 1000 to 2000 µs.
-//! - Add a 10 kΩ pull-down from Uno D2 to GND so a disconnected input is LOW.
+//! - Pi Player 1 PWM -> level shifter/buffer -> Uno D2.
+//! - Pi Player 2 PWM -> level shifter/buffer -> Uno D3.
+//! - Emit one positive pulse per player every 20 ms (50 Hz), with a width from
+//!   1000 to 2000 µs.
+//! - Add separate 10 kΩ pull-downs from D2 and D3 to GND so disconnected inputs
+//!   have a defined LOW state.
 //! - Pi GND -> Uno GND.  A shared ground is required; do *not* connect the Pi
 //!   GPIO to the Uno without it.
-//! - Uno D9 -> servo signal; power the servo from an appropriately rated 5 V
-//!   supply and connect that supply's ground to Uno/Pi ground.
-//! - Uno D13 -> onboard status LED; ON means valid D2 pulses are arriving.
-//!   OFF means the input has timed out.
+//! - Uno D9 -> Player 1 servo signal; Uno D10 -> Player 2 servo signal.
+//! - Power both servos from an appropriately rated external 5 V supply and
+//!   connect that supply's ground to Uno/Pi ground.
+//! - Uno D13 -> onboard status LED; ON means valid pulses are arriving for both
+//!   players.  OFF means either control input has timed out.
 //! - A 3.3 V Pi GPIO is not guaranteed to meet the ATmega328P's HIGH threshold
 //!   when the Uno runs at 5 V.  The final circuit therefore needs a validated
 //!   3.3 V-to-5 V level shifter/buffer (or a confirmed 3.3 V Uno design).
 //!
-//! If valid control pulses stop, the servo returns to centre after 100–120 ms
-//! (the timeout is checked on 20 ms frame boundaries).  The output remains
-//! exactly 50 Hz while input measurement and fail-safe handling occur
-//! asynchronously.
+//! If valid control pulses stop on either channel, only that player's servo
+//! returns to centre after 100–120 ms (the timeout is checked on 20 ms frame
+//! boundaries).  Both outputs remain exactly 50 Hz while input measurement and
+//! fail-safe handling occur asynchronously.
 //!
 //! The merged ESP template also referred to GPIO1 (TX) and GPIO3 (RX).  Those
 //! are ESP UART0 assignments, not Arduino Uno UART assignments.  On the Uno,
@@ -48,11 +53,28 @@ const CENTRE_COUNTS: u16 = 1_500 * TIMER_COUNTS_PER_US;
 const MAX_CONTROL_COUNTS: u16 = 2_000 * TIMER_COUNTS_PER_US;
 const TIMEOUT_FRAMES: u8 = 6; // guarantees at least 100 ms; checked every 20 ms
 
-struct InterruptState {
-    status_led: Pin<Output>,
+struct ControlChannel {
     rise_count: u16,
+    rise_overflows: u8,
     awaiting_fall: bool,
     frames_since_valid: u8,
+}
+
+impl ControlChannel {
+    const fn timed_out() -> Self {
+        Self {
+            rise_count: 0,
+            rise_overflows: 0,
+            awaiting_fall: false,
+            frames_since_valid: TIMEOUT_FRAMES,
+        }
+    }
+}
+
+struct InterruptState {
+    status_led: Pin<Output>,
+    player1: ControlChannel,
+    player2: ControlChannel,
 }
 
 struct GlobalInterruptState(UnsafeCell<mem::MaybeUninit<InterruptState>>);
@@ -78,63 +100,114 @@ fn timer1() -> &'static arduino_hal::pac::tc1::RegisterBlock {
 
 fn external_interrupts() -> &'static arduino_hal::pac::exint::RegisterBlock {
     // SAFETY: EXINT is configured before global interrupts are enabled and is
-    // subsequently changed only by the INT0/TIMER1_OVF handlers.
+    // subsequently changed only by the non-nesting INT0 and INT1 handlers.
     unsafe { &*arduino_hal::pac::EXINT::ptr() }
 }
 
-// D2/INT0 alternates between rising- and falling-edge detection.  Timer1's
-// free-running counter timestamps both edges with 0.5 µs resolution.
+/// Records one edge for a player and returns a valid completed pulse width.
+fn capture_edge(channel: &mut ControlChannel, now: u16) -> Option<u16> {
+    if !channel.awaiting_fall {
+        channel.rise_count = now;
+        channel.rise_overflows = 0;
+        channel.awaiting_fall = true;
+        return None;
+    }
+
+    let width = if now >= channel.rise_count {
+        now - channel.rise_count
+    } else {
+        FRAME_COUNTS - channel.rise_count + now
+    };
+
+    channel.awaiting_fall = false;
+    if channel.rise_overflows <= 1 && (MIN_CONTROL_COUNTS..=MAX_CONTROL_COUNTS).contains(&width) {
+        channel.frames_since_valid = 0;
+        Some(width)
+    } else {
+        None
+    }
+}
+
+fn update_status_led(state: &mut InterruptState) {
+    let both_healthy = state.player1.frames_since_valid < TIMEOUT_FRAMES
+        && state.player2.frames_since_valid < TIMEOUT_FRAMES;
+    if both_healthy {
+        state.status_led.set_high();
+    } else {
+        state.status_led.set_low();
+    }
+}
+
+/// Advances one channel's timeout and returns whether its servo must centre.
+fn advance_timeout(channel: &mut ControlChannel) -> bool {
+    if channel.awaiting_fall {
+        channel.rise_overflows = channel.rise_overflows.saturating_add(1);
+    }
+    if channel.frames_since_valid < TIMEOUT_FRAMES {
+        channel.frames_since_valid += 1;
+    }
+    channel.frames_since_valid >= TIMEOUT_FRAMES
+}
+
+// D2/INT0 measures the Player 1 control pulse.
 #[avr_device::interrupt(atmega328p)]
 fn INT0() {
     let state = interrupt_state();
     let now = timer1().tcnt1().read().bits();
+    let was_awaiting_fall = state.player1.awaiting_fall;
 
-    if state.awaiting_fall {
-        let width = if now >= state.rise_count {
-            now - state.rise_count
-        } else {
-            FRAME_COUNTS - state.rise_count + now
-        };
-
-        if (MIN_CONTROL_COUNTS..=MAX_CONTROL_COUNTS).contains(&width) {
-            timer1().ocr1a().write(|w| w.set(width));
-            state.frames_since_valid = 0;
-            state.status_led.set_high();
-        }
-
-        state.awaiting_fall = false;
+    if let Some(width) = capture_edge(&mut state.player1, now) {
+        timer1().ocr1a().write(|w| w.set(width));
+    }
+    if was_awaiting_fall {
         external_interrupts()
             .eicra()
             .modify(|_, w| w.isc0().set(0b11)); // next rising edge
     } else {
-        state.rise_count = now;
-        state.awaiting_fall = true;
         external_interrupts()
             .eicra()
             .modify(|_, w| w.isc0().set(0b10)); // next falling edge
     }
+    update_status_led(state);
+}
+
+// D3/INT1 measures the Player 2 control pulse.
+#[avr_device::interrupt(atmega328p)]
+fn INT1() {
+    let state = interrupt_state();
+    let now = timer1().tcnt1().read().bits();
+    let was_awaiting_fall = state.player2.awaiting_fall;
+
+    if let Some(width) = capture_edge(&mut state.player2, now) {
+        timer1().ocr1b().write(|w| w.set(width));
+    }
+    if was_awaiting_fall {
+        external_interrupts()
+            .eicra()
+            .modify(|_, w| w.isc1().set(0b11)); // next rising edge
+    } else {
+        external_interrupts()
+            .eicra()
+            .modify(|_, w| w.isc1().set(0b10)); // next falling edge
+    }
+    update_status_led(state);
 }
 
 // Timer1 overflows exactly once per 20 ms servo frame.  It therefore provides
-// a timeout clock without disturbing the hardware-generated D9 waveform.
+// a timeout clock without disturbing either hardware-generated PWM waveform.
 #[avr_device::interrupt(atmega328p)]
 fn TIMER1_OVF() {
     let state = interrupt_state();
 
-    if state.frames_since_valid < TIMEOUT_FRAMES {
-        state.frames_since_valid += 1;
-    }
-
-    if state.frames_since_valid >= TIMEOUT_FRAMES {
+    if advance_timeout(&mut state.player1) {
         timer1().ocr1a().write(|w| w.set(CENTRE_COUNTS));
-        state.status_led.set_low();
-
-        // Recover if an input rose but never fell.
-        state.awaiting_fall = false;
-        external_interrupts()
-            .eicra()
-            .modify(|_, w| w.isc0().set(0b11));
     }
+
+    if advance_timeout(&mut state.player2) {
+        timer1().ocr1b().write(|w| w.set(CENTRE_COUNTS));
+    }
+
+    update_status_led(state);
 }
 
 #[arduino_hal::entry]
@@ -143,37 +216,50 @@ fn main() -> ! {
     let pins = arduino_hal::pins!(dp);
 
     // These conversions configure the corresponding ATmega328P DDR bits.
-    // D9 is OC1A, D2 is INT0, and D13 is the Uno's onboard LED.
+    // D9/D10 are Timer1 outputs OC1A/OC1B, D2/D3 are INT0/INT1, and D13 is
+    // the Uno's onboard status LED.
     pins.d9.into_output();
+    pins.d10.into_output();
     pins.d2.into_floating_input();
+    pins.d3.into_floating_input();
     let mut status_led = pins.d13.into_output().downgrade();
     status_led.set_low();
 
     unsafe {
         *INTERRUPT_STATE.0.get() = mem::MaybeUninit::new(InterruptState {
             status_led,
-            rise_count: 0,
-            awaiting_fall: false,
-            frames_since_valid: TIMEOUT_FRAMES,
+            player1: ControlChannel::timed_out(),
+            player2: ControlChannel::timed_out(),
         });
         atomic::compiler_fence(atomic::Ordering::SeqCst);
     }
 
-    // Fast PWM mode 14: TOP=ICR1, non-inverting OC1A/D9, prescaler 8.
+    // Fast PWM mode 14: TOP=ICR1, non-inverting OC1A/D9 and OC1B/D10,
+    // prescaler 8.
     // 16 MHz / 8 / 40_000 = exactly 50 Hz.
     dp.TC1.icr1().write(|w| w.set(TIMER_TOP));
     dp.TC1.ocr1a().write(|w| w.set(CENTRE_COUNTS));
-    dp.TC1
-        .tccr1a()
-        .write(|w| w.wgm1().set(0b10).com1a().match_clear());
+    dp.TC1.ocr1b().write(|w| w.set(CENTRE_COUNTS));
+    dp.TC1.tccr1a().write(|w| {
+        w.wgm1()
+            .set(0b10)
+            .com1a()
+            .match_clear()
+            .com1b()
+            .match_clear()
+    });
     dp.TC1
         .tccr1b()
         .write(|w| w.wgm1().set(0b11).cs1().prescale_8());
     dp.TC1.timsk1().write(|w| w.toie1().set_bit());
 
-    // Trigger INT0 on the first rising edge, then let the ISR alternate edges.
-    dp.EXINT.eicra().write(|w| w.isc0().set(0b11));
-    dp.EXINT.eimsk().write(|w| w.int0().set_bit());
+    // Trigger both inputs on their first rising edge, then alternate edges.
+    dp.EXINT
+        .eicra()
+        .write(|w| w.isc0().set(0b11).isc1().set(0b11));
+    dp.EXINT
+        .eimsk()
+        .write(|w| w.int0().set_bit().int1().set_bit());
 
     unsafe { avr_device::interrupt::enable() };
 
