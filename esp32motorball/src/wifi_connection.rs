@@ -4,8 +4,8 @@ use esp_radio::wifi::{
     sta::StationConfig, AuthenticationMethod, Config, ControllerConfig, WifiController,
 };
 
-const SSID: &str = "Wokwi-GUEST";
-const PASSWORD: &str = "";
+const SSID: &str = "UoA-Unleash";
+const PASSWORD: &str = "UoA_Unl3ash";
 
 pub async fn connect_wifi(mut controls: HardwareControls) -> HardwareControls {
     let wifi_peripheral = match controls.wifi {
