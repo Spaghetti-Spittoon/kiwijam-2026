@@ -6,22 +6,6 @@
     { "type": "wokwi-arduino-uno", "id": "uno", "top": 0, "left": 0, "attrs": {} },
     { "type": "wokwi-servo", "id": "servo1", "top": -110, "left": 200, "attrs": {} },
     { "type": "wokwi-servo", "id": "servo2", "top": -110, "left": 430, "attrs": {} },
-    {
-      "type": "wokwi-resistor",
-      "id": "controlPulldown",
-      "top": 85,
-      "left": 210,
-      "rotate": 90,
-      "attrs": { "value": "10000" }
-    },
-    {
-      "type": "wokwi-resistor",
-      "id": "controlPulldown2",
-      "top": 85,
-      "left": 250,
-      "rotate": 90,
-      "attrs": { "value": "10000" }
-    },
     { "type": "wokwi-vcc", "id": "servo5v", "top": -145, "left": 335, "attrs": {} },
     { "type": "wokwi-gnd", "id": "sharedGnd", "top": 25, "left": 335, "attrs": {} },
     {
@@ -37,7 +21,7 @@
       "top": -190,
       "left": -20,
       "attrs": {
-        "text": "TWO-PLAYER UNO SERVO DRIVER\nP1: D2/INT0 <- Pi PWM; D9/OC1A -> Servo 1\nP2: D3/INT1 <- Pi PWM; D10/OC1B -> Servo 2\nBoth: 50 Hz, 1000-2000 us HIGH\nD13 -> both control links healthy"
+        "text": "TWO-PLAYER UNO SERVO DRIVER\nPi USB serial -> Uno UART at 115200 baud\nD9/OC1A -> Servo 1; D10/OC1B -> Servo 2\nBoth outputs: hardware-timed 50 Hz\nD13 ON -> valid serial frames arriving"
       }
     },
     {
@@ -46,7 +30,7 @@
       "top": 110,
       "left": -20,
       "attrs": {
-        "text": "D2 and D3 each require a 10k pulldown and\nvalidated 3.3 V-to-5 V level shifting from the Pi.\nUse one external 5 V supply rated for both servos.\nAll Pi, Uno, supply and servo grounds are shared.\nEach lost signal independently centers its servo."
+        "text": "Connect the Uno to the Pi by USB; GPIO control\nwires and level shifting are no longer required.\nUse one external 5 V supply rated for both servos.\nA serial timeout centers both servos."
       }
     }
   ],
@@ -58,15 +42,9 @@
     [ "servo2:V+", "servo5v:VCC", "red", [ "h0" ] ],
     [ "servo2:GND", "sharedGnd:GND", "black", [ "h0" ] ],
     [ "uno:GND.1", "sharedGnd:GND", "black", [ "h0" ] ],
-    [ "controlPulldown:1", "uno:2", "blue", [ "h-30" ] ],
-    [ "controlPulldown:2", "sharedGnd:GND", "black", [ "h40" ] ],
-    [ "controlPulldown2:1", "uno:3", "cyan", [ "h-30" ] ],
-    [ "controlPulldown2:2", "sharedGnd:GND", "black", [ "h40" ] ],
-    [ "logic1:D0", "uno:2", "blue", [ "h-60", "v-20" ] ],
-    [ "logic1:D1", "uno:3", "cyan", [ "h-50", "v-30" ] ],
-    [ "logic1:D2", "uno:9", "green", [ "h-40", "v-40" ] ],
-    [ "logic1:D3", "uno:10", "purple", [ "h-30", "v-50" ] ],
-    [ "logic1:D4", "uno:13", "orange", [ "h-20", "v-60" ] ],
+    [ "logic1:D0", "uno:9", "green", [ "h-40", "v-40" ] ],
+    [ "logic1:D1", "uno:10", "purple", [ "h-30", "v-50" ] ],
+    [ "logic1:D2", "uno:13", "orange", [ "h-20", "v-60" ] ],
     [ "logic1:GND", "uno:GND.2", "black", [ "h-80" ] ]
   ],
   "dependencies": {}

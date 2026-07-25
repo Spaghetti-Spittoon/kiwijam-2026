@@ -1,55 +1,50 @@
-# Raspberry Pi web server and Uno PWM transmitter
+# Raspberry Pi web server and Uno USB serial control
 
 `piwebserver` reads the two player inputs, calculates `n1,n2` in the range
-0–255, and transmits both values to the Uno as independent, hardware-timed
-50 Hz servo-style PWM signals.
+0–255, and sends both values to the Uno over its USB serial connection.
+The Uno—not Linux—generates both stable 50 Hz servo signals.
 
-## Pin assignment
+## Connections
 
-| Player | Pi hardware PWM | BCM GPIO | Pi header pin | Uno input |
-| --- | --- | --- | --- | --- |
-| 1 | PWM0 | GPIO18 | 12 | D2 / INT0 |
-| 2 | PWM1 | GPIO19 | 35 | D3 / INT1 |
+- Connect the Uno USB port to the Raspberry Pi.
+- Uno D9 is Player 1's servo signal.
+- Uno D10 is Player 2's servo signal.
+- Power both servos from a regulated external 5 V supply rated for their
+  combined current.
+- Join the external supply ground to Uno ground.
+- Do not connect Pi GPIO18/GPIO19 to Uno D2/D3; they are not used by the serial
+  transport.
 
-Each control value is converted with:
+USB powers the Uno but must not be used to power both servos.
+
+## Serial protocol
+
+The default device is `/dev/ttyACM0` at 115200 baud. Every 50 ms the Pi sends:
 
 ```text
-pulse_us = 1000 + value * 1000 / 255
+0xA5 | sequence | player1 | player2 | CRC-8
 ```
 
-Thus 0 produces approximately 1000 us HIGH, 128 approximately 1500 us, and
-255 exactly 2000 us. RPPAL programs the Pi PWM peripheral with a 20 ms period;
-ordinary Linux sleep timing is not used to form the pulses.
+CRC-8 uses polynomial `0x07` over the first four bytes. Opening the serial port
+resets an Uno, so the server waits two seconds for its bootloader. It reconnects
+automatically after unplugging. The Uno returns both servos to centre if valid
+frames stop for approximately 250 ms.
 
-## Raspberry Pi setup
-
-On the Raspberry Pi 3B+, add these lines to `/boot/config.txt`:
+For a persistent udev symlink, override the path in the systemd service:
 
 ```ini
-dtparam=audio=off
-dtoverlay=pwm-2chan
+Environment=PIWS_UNO_SERIAL=/dev/serial/by-id/<exact-device-name>
 ```
 
-The `pwm-2chan` overlay defaults to PWM0 on GPIO18 and PWM1 on GPIO19. Analog
-audio must be disabled because it otherwise uses the same PWM channels. Reboot
-after changing the boot configuration.
+Use the exact path reported by:
 
-The process must have permission to use `/sys/class/pwm`. Run the deployed
-service with suitable PWM permissions (or as root). Startup deliberately fails
-with a descriptive error if either hardware channel cannot be opened, so the
-web server cannot appear healthy while control output is missing.
+```bash
+ls -l /dev/serial/by-id/
+```
 
-For development on a Linux machine that is not a Pi, set
-`PIWS_DISABLE_SERVO_PWM=1`. Non-Linux builds automatically omit the Pi hardware
-backend.
+The service currently runs as root and therefore has serial-device permission.
+For a non-root service, add its user to the `dialout` group.
 
-## Electrical connection
-
-Pi GPIO is 3.3 V. Route GPIO18 and GPIO19 through separate, validated
-non-inverting 3.3 V-to-5 V level-shifter/buffer channels before Uno D2 and D3.
-Add a 10 kΩ pull-down at each Uno input and join the Pi, Uno, level shifter,
-servo supply, and servo grounds. Do not power either servo from a Pi GPIO pin;
-use an external 5 V supply rated for both servos.
-
-The Uno firmware then drives Player 1's servo signal on D9 and Player 2's on
-D10.
+The earlier GPIO PWM transport is no longer used. `dtoverlay=pwm-2chan` and
+`dtparam=audio=off` may be removed from `/boot/config.txt` if analog audio is
+needed again; changing boot configuration requires one reboot.
