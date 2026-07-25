@@ -35,6 +35,6 @@ async fn main(_spawner: Spawner) -> ! {
         let tilt = read_tilt_sensor().await;
         drive_motors(server_result.motor_action, tilt).await;
         drive_led(server_result.led_action).await;
-        Timer::after(Duration::from_millis(5000)).await;
+        Timer::after(Duration::from_millis(100)).await;
     }
 }
