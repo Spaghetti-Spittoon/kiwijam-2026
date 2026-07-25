@@ -33,7 +33,7 @@ async fn main(spawner: Spawner) -> ! {
     loop {
         let server_result = poll_server(&mut connection).await;
         let tilt = read_tilt_sensor().await;
-        drive_motors(&hardware, server_result.motor_action, tilt).await;
+        drive_motors(&mut hardware, server_result.motor_action, tilt).await;
         drive_led(&mut hardware, server_result.led_action).await;
         Timer::after(Duration::from_millis(100)).await;
     }

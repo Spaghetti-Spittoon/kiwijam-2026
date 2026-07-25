@@ -7,6 +7,8 @@ use esp_hal::timer::timg::TimerGroup;
 
 pub struct HardwareControls {
     pub led: Output<'static>,
+    pub motor_left: Output<'static>,
+    pub motor_right: Output<'static>,
     pub wifi: Option<WIFI<'static>>,
     pub rng: Rng,
 }
@@ -22,9 +24,13 @@ pub fn initialise_hardware() -> HardwareControls {
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
     let led = Output::new(peripherals.GPIO2, Level::Low, OutputConfig::default());
+    let motor_left = Output::new(peripherals.GPIO26, Level::Low, OutputConfig::default());
+    let motor_right = Output::new(peripherals.GPIO27, Level::Low, OutputConfig::default());
 
     HardwareControls {
         led,
+        motor_left,
+        motor_right,
         wifi: Some(peripherals.WIFI),
         rng: Rng::new(),
     }
