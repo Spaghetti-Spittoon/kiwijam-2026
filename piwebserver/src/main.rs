@@ -5,6 +5,8 @@ use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
 use gilrs::{Axis, Button, Event, EventType, Gamepad, Gilrs};
 use serde::Deserialize;
 
+mod servo_pwm;
+
 const ENTANGLE: f32 = 0.15;
 const DEADZONE: f32 = 0.12;
 
@@ -484,6 +486,12 @@ async fn main() -> std::io::Result<()> {
     spawn_gamepad_reader(state.clone());
     spawn_drift(state.clone());
     spawn_logger(state.clone());
+    let pwm_state = state.clone();
+    servo_pwm::spawn(move || {
+        let raw = *pwm_state.controls.lock().unwrap();
+        let drift = *pwm_state.drift.lock().unwrap();
+        entangled(raw, drift)
+    })?;
 
     let addr = ("0.0.0.0", 7777);
     println!(

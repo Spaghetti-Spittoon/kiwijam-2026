@@ -1,5 +1,8 @@
 # kiwijam-2026
 
+The Raspberry Pi server's two-player hardware PWM setup and Pi-to-Uno wiring
+are documented in [`piwebserver/README.md`](piwebserver/README.md).
+
 ## Flashing the ESP8266
 
 ```
