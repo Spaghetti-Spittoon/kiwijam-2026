@@ -20,12 +20,15 @@ fn main() {
 
     let ssid = prompt(&mut tty_out, &mut tty_reader, "SSID", false);
     let password = prompt(&mut tty_out, &mut tty_reader, "Password", true);
+    let ip_and_port = prompt(&mut tty_out, &mut tty_reader,
+        "Server IP and port (e.g. 127.0.0.1:7777)", false);
 
     assert!(!ssid.is_empty(), "SSID must not be empty");
     assert!(!password.is_empty(), "Password must not be empty");
 
     println!("cargo:rustc-env=WIFI_SSID={ssid}");
     println!("cargo:rustc-env=WIFI_PASSWORD={password}");
+    println!("cargo:rustc-env=SERVER_IP_AND_PORT={ip_and_port}");
 }
 
 fn prompt<W: Write>(out: &mut W, input: &mut BufReader<File>, label: &str, hide: bool) -> String {
