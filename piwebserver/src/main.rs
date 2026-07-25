@@ -1,17 +1,21 @@
 //! Raspberry Pi sensor-input web server (actix-web) — issue #20.
 //!
-//! Reads controller / mouse X-axis input from a browser client, stores the
-//! latest value per player in memory, applies "Quantum Entanglement" (a control
-//! nudges the opposing player's axis the opposite way), and serves the result
-//! over HTTP.
+//! Reads controller / mouse X-axis input, stores the latest RAW value per player
+//! in memory, and serves an entangled "steering" angle in the 0..180 range
+//! (90 = centre) over HTTP. Two effects shape the served value:
+//!   1. Opponent coupling (the core "Quantum Entanglement"): each player's angle
+//!      is nudged in the OPPOSITE direction of the opponent's deviation.
+//!   2. A gentle wandering drift per player: the neutral point slowly strays off
+//!      90, so a centred stick isn't always exactly 90 and "turning left" can
+//!      read slightly right — quantum uncertainty for flavour.
 //!
 //! We deliberately do NOT send TTL signals to the Arduino Uno. Instead the web
 //! server *is* the controller-data source: consumers poll the API.
 //!
 //! Endpoints:
 //!   GET  /                   -> client page: captures mouse + Gamepad X, live view
-//!   POST /input/{p1|p2}      -> body {"x": -1.0..1.0}; store + entangle opponent
-//!   GET  /api/controls       -> {"p1": x, "p2": x}   (replaces TTL-to-Uno)
+//!   POST /input/{p1|p2}      -> body {"x": -1.0..1.0}; store RAW input
+//!   GET  /api/controls       -> {"p1": deg, "p2": deg}  0..180, 90=centre
 //!   GET  /api/motor          -> {"motor": "start"|"stop"}
 //!   POST /motor/{start|stop} -> set run/stop
 //!
@@ -24,11 +28,21 @@ use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
 use gilrs::{Axis, Gilrs};
 use serde::{Deserialize, Serialize};
 
-/// How strongly a control tugs the opposing player's axis the opposite way.
+/// How strongly a control tugs the opposing player's angle the opposite way.
 const ENTANGLE: f32 = 0.15;
-
 /// Ignore small resting-stick drift near centre.
 const DEADZONE: f32 = 0.12;
+
+/// Served-angle geometry: 0..180 degrees, 90 = neutral, full stick = +/-90.
+const CENTER: f32 = 90.0;
+const SPAN: f32 = 90.0;
+
+/// Wandering-drift bounds (degrees). Set DRIFT_MAX = 0.0 for pure coupling.
+const DRIFT_MAX: f32 = 15.0;
+/// Random-walk step per tick (degrees) and pull-back toward centre.
+const DRIFT_STEP: f32 = 1.5;
+const DRIFT_DECAY: f32 = 0.97;
+const DRIFT_TICK_MS: u64 = 120;
 
 /// Whether the motorball should run. Mirrors esp8266motorball's MotorAction.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,23 +60,31 @@ impl MotorAction {
     }
 }
 
-/// Latest RAW X-axis (-1.0..=1.0) per player, before entanglement.
+/// Latest RAW X-axis (-1.0..=1.0) per player, before drift/entanglement.
 #[derive(Clone, Copy)]
 struct Controls {
     p1: f32,
     p2: f32,
 }
 
-/// Entangled X-axis output served to clients/devices.
-#[derive(Serialize)]
-struct ControlsOut {
+/// Slowly wandering neutral-point offset per player, in degrees.
+#[derive(Clone, Copy, Default)]
+struct Drift {
     p1: f32,
     p2: f32,
+}
+
+/// Entangled steering angle served to clients/devices (0..180, 90 = centre).
+#[derive(Serialize)]
+struct ControlsOut {
+    p1: i32,
+    p2: i32,
 }
 
 struct AppState {
     motor: Mutex<MotorAction>,
     controls: Mutex<Controls>,
+    drift: Mutex<Drift>,
 }
 
 #[derive(Deserialize)]
@@ -79,17 +101,82 @@ fn clamp_axis(v: f32) -> f32 {
     if v.is_nan() { 0.0 } else { v.clamp(-1.0, 1.0) }
 }
 
-/// Quantum Entanglement: each player's served axis is nudged in the opposite
-/// direction of the opponent's raw value. Derived from the raw inputs (not
-/// stored) so a continuous 50 Hz controller stream doesn't compound the nudge.
-fn entangled(raw: Controls) -> ControlsOut {
+/// Raw stick (-1..1) -> steering angle in degrees (0..180).
+fn to_deg(x: f32) -> f32 {
+    CENTER + x * SPAN
+}
+
+fn clamp_deg(v: f32) -> i32 {
+    v.clamp(0.0, 180.0).round() as i32
+}
+
+/// Combine the two effects into the served angles:
+///   * add each player's wandering drift to their own angle, then
+///   * apply opponent coupling (the core entanglement): nudge opposite to the
+///     opponent's deviation from centre.
+fn entangled(raw: Controls, drift: Drift) -> ControlsOut {
+    let b1 = to_deg(raw.p1) + drift.p1;
+    let b2 = to_deg(raw.p2) + drift.p2;
+    let o1 = CENTER + (b1 - CENTER) - ENTANGLE * (b2 - CENTER);
+    let o2 = CENTER + (b2 - CENTER) - ENTANGLE * (b1 - CENTER);
     ControlsOut {
-        p1: clamp_axis(raw.p1 - ENTANGLE * raw.p2),
-        p2: clamp_axis(raw.p2 - ENTANGLE * raw.p1),
+        p1: clamp_deg(o1),
+        p2: clamp_deg(o2),
     }
 }
 
-/// Store a player's RAW X-axis; entanglement is applied when the data is read.
+/// Tiny xorshift64 PRNG — enough for gentle drift without a `rand` dependency.
+struct Rng(u64);
+
+impl Rng {
+    fn from_time() -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        Rng(seed | 1)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    /// Uniform in [-1.0, 1.0).
+    fn signed_unit(&mut self) -> f32 {
+        let u = (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32; // [0,1)
+        u * 2.0 - 1.0
+    }
+}
+
+/// One step of a bounded random walk that decays toward centre.
+fn wander(v: f32, rng: &mut Rng) -> f32 {
+    (v * DRIFT_DECAY + DRIFT_STEP * rng.signed_unit()).clamp(-DRIFT_MAX, DRIFT_MAX)
+}
+
+/// Background thread: slowly wander each player's neutral-point drift.
+fn spawn_drift(state: web::Data<AppState>) {
+    if DRIFT_MAX <= 0.0 {
+        return; // pure coupling, no drift
+    }
+    std::thread::spawn(move || {
+        let mut rng = Rng::from_time();
+        loop {
+            {
+                let mut d = state.drift.lock().unwrap();
+                d.p1 = wander(d.p1, &mut rng);
+                d.p2 = wander(d.p2, &mut rng);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(DRIFT_TICK_MS));
+        }
+    });
+}
+
+/// Store a player's RAW X-axis; drift + entanglement are applied when read.
 #[post("/input/{player}")]
 async fn set_input(
     path: web::Path<String>,
@@ -97,20 +184,25 @@ async fn set_input(
     data: web::Data<AppState>,
 ) -> impl Responder {
     let x = clamp_axis(body.x);
-    let mut c = data.controls.lock().unwrap();
-    match path.into_inner().as_str() {
-        "p1" => c.p1 = x,
-        "p2" => c.p2 = x,
-        _ => return HttpResponse::BadRequest().body("unknown player (use p1|p2)"),
-    }
-    HttpResponse::Ok().json(entangled(*c))
+    let raw = {
+        let mut c = data.controls.lock().unwrap();
+        match path.into_inner().as_str() {
+            "p1" => c.p1 = x,
+            "p2" => c.p2 = x,
+            _ => return HttpResponse::BadRequest().body("unknown player (use p1|p2)"),
+        }
+        *c
+    };
+    let drift = *data.drift.lock().unwrap();
+    HttpResponse::Ok().json(entangled(raw, drift))
 }
 
 /// Controller data the device polls (instead of receiving TTL).
 #[get("/api/controls")]
 async fn api_controls(data: web::Data<AppState>) -> impl Responder {
     let raw = *data.controls.lock().unwrap();
-    web::Json(entangled(raw))
+    let drift = *data.drift.lock().unwrap();
+    web::Json(entangled(raw, drift))
 }
 
 /// Whether the motorball should run or stop.
@@ -225,15 +317,16 @@ const PAGE: &str = r##"<!doctype html>
       <button class="stop" onclick="motor('stop')">Stop</button>
     </div>
     <div class="player p1">
-      <div class="label"><span>Player 1 &nbsp;(mouse X)</span><span id="p1-val">0.00</span></div>
+      <div class="label"><span>Player 1 &nbsp;(mouse X)</span><span id="p1-val">90&deg;</span></div>
       <div class="track"><div class="center"></div><div id="p1-fill" class="fill"></div></div>
     </div>
     <div class="player p2">
-      <div class="label"><span>Player 2 &nbsp;(gamepad axis 0)</span><span id="p2-val">0.00</span></div>
+      <div class="label"><span>Player 2 &nbsp;(gamepad axis 0)</span><span id="p2-val">90&deg;</span></div>
       <div class="track"><div class="center"></div><div id="p2-fill" class="fill"></div></div>
     </div>
-    <div class="hint">Move the mouse to drive P1. Connect a gamepad for P2. Quantum entanglement
-      tugs the opponent the opposite way. Data at <a href="/api/controls">/api/controls</a>.</div>
+    <div class="hint">Move the mouse to drive P1. Connect a gamepad for P2. Served angles are 0&ndash;180&deg;
+      (90 = centre): opponent coupling plus a gentle wandering drift. Data at
+      <a href="/api/controls">/api/controls</a>.</div>
   </div>
 <script>
 const throttle = {};
@@ -253,9 +346,9 @@ function pollPads() {
   requestAnimationFrame(pollPads);
 }
 pollPads();
-function setBar(id, x) {
-  document.getElementById(id + '-fill').style.left = ((x + 1) / 2 * 100) + '%';
-  document.getElementById(id + '-val').textContent = x.toFixed(2);
+function setBar(id, deg) {
+  document.getElementById(id + '-fill').style.left = (deg / 180 * 100) + '%';
+  document.getElementById(id + '-val').textContent = Math.round(deg) + '°';
 }
 async function refresh() {
   try {
@@ -278,10 +371,13 @@ async fn main() -> std::io::Result<()> {
     let state = web::Data::new(AppState {
         motor: Mutex::new(MotorAction::Stop),
         controls: Mutex::new(Controls { p1: 0.0, p2: 0.0 }),
+        drift: Mutex::new(Drift::default()),
     });
 
     // Read the physical Xbox controller on the (headless) Pi.
     spawn_gamepad_reader(state.clone());
+    // Slowly wander each player's neutral point (quantum uncertainty).
+    spawn_drift(state.clone());
 
     let addr = ("0.0.0.0", 8080);
     println!("piwebserver: control panel  http://localhost:{}/", addr.1);
