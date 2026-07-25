@@ -26,7 +26,7 @@
 use std::sync::Mutex;
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
-use gilrs::{Axis, Button, Gamepad, Gilrs};
+use gilrs::{Axis, Button, Event, EventType, Gamepad, Gilrs};
 use serde::{Deserialize, Serialize};
 
 /// How strongly a control tugs the opposing player's angle the opposite way.
@@ -265,9 +265,29 @@ fn spawn_gamepad_reader(state: web::Data<AppState>) {
         };
         eprintln!("gamepad: reader started (waiting for a controller)");
         loop {
-            // Pump events so `value()`/`is_pressed()` reflect the latest state.
-            while gilrs.next_event().is_some() {}
+            // Drain pending events so `value()`/`is_pressed()` are current, and
+            // log connects/disconnects/button presses for diagnostics.
+            let mut drained = 0;
+            while let Some(Event { id, event, .. }) = gilrs.next_event() {
+                match event {
+                    EventType::Connected => {
+                        eprintln!("gamepad {}: CONNECTED: {}", id, gilrs.gamepad(id).name());
+                    }
+                    EventType::Disconnected => eprintln!("gamepad {}: disconnected", id),
+                    EventType::ButtonPressed(b, _) => eprintln!("gamepad {}: BUTTON {:?}", id, b),
+                    EventType::AxisChanged(a, v, _) if v.abs() > 0.5 => {
+                        eprintln!("gamepad {}: AXIS {:?} = {:.2}", id, a, v)
+                    }
+                    _ => {}
+                }
+                drained += 1;
+                if drained > 512 {
+                    break; // don't spin forever on a flood of stick-jitter events
+                }
+            }
 
+            // Read current state into locals, THEN take the lock only to write
+            // (keeps the controls mutex held for microseconds, not starving readers).
             let pads: Vec<_> = gilrs.gamepads().collect();
             if let Some((_, pad0)) = pads.first() {
                 // P1: left stick, or D-pad Left/Right buttons.
@@ -280,9 +300,10 @@ fn spawn_gamepad_reader(state: web::Data<AppState>) {
                     }
                     None => steer(pad0, Axis::RightStickX, Button::LeftTrigger, Button::RightTrigger),
                 };
+                let (p1, p2) = (clamp_axis(p1), clamp_axis(p2));
                 let mut c = state.controls.lock().unwrap();
-                c.p1 = clamp_axis(p1);
-                c.p2 = clamp_axis(p2);
+                c.p1 = p1;
+                c.p2 = p2;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
