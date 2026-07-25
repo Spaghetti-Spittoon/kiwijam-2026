@@ -257,16 +257,77 @@ fn apply_mouse_dx(state: &web::Data<AppState>, dx: i32) {
 }
 
 #[cfg(target_os = "linux")]
-fn spawn_mouse_reader(state: web::Data<AppState>) {
-    std::thread::spawn(move || {
-        use evdev::{EventType as EvType, RelativeAxisType};
-        loop {
-            let found = evdev::enumerate().find(|(_, d)| {
+fn diagnose_input_devices() {
+    use evdev::{BusType, Device, Key, RelativeAxisType};
+    let dir = match std::fs::read_dir("/dev/input") {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("mouse: cannot read /dev/input ({e})");
+            return;
+        }
+    };
+    let mut nodes: Vec<_> = dir
+        .filter_map(|r| r.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("event"))
+        .map(|e| e.path())
+        .collect();
+    nodes.sort();
+    if nodes.is_empty() {
+        eprintln!("mouse: /dev/input has no event* nodes");
+        return;
+    }
+    let mut denied = 0;
+    for path in nodes {
+        match Device::open(&path) {
+            Ok(d) => {
                 let has_rel_x = d
                     .supported_relative_axes()
                     .map_or(false, |a| a.contains(RelativeAxisType::REL_X));
-                // Require a mouse button too, so we don't grab non-pointer devices
-                // that merely advertise REL_X (e.g. the Pi's `vc4` display node).
+                let has_button = d
+                    .supported_keys()
+                    .map_or(false, |k| k.contains(Key::BTN_LEFT));
+                let bus = d.input_id().bus_type();
+                eprintln!(
+                    "mouse: scan {} name={:?} bus={} usb={} rel_x={} btn_left={}",
+                    path.display(),
+                    d.name().unwrap_or("?"),
+                    bus,
+                    bus == BusType::BUS_USB,
+                    has_rel_x,
+                    has_button
+                );
+            }
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    denied += 1;
+                }
+                eprintln!("mouse: scan {} error: {}", path.display(), e);
+            }
+        }
+    }
+    if denied > 0 {
+        eprintln!(
+            "mouse: {denied} device(s) refused with permission denied — \
+             add your user to the `input` group (usermod -aG input $USER) \
+             or install a udev rule granting the input group access to /dev/input/event*"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_mouse_reader(state: web::Data<AppState>) {
+    std::thread::spawn(move || {
+        use evdev::{BusType, EventType as EvType, RelativeAxisType};
+        let mut diagnosed = false;
+        let mut waiting_logged = false;
+        loop {
+            let found = evdev::enumerate().find(|(_, d)| {
+                if d.input_id().bus_type() != BusType::BUS_USB {
+                    return false;
+                }
+                let has_rel_x = d
+                    .supported_relative_axes()
+                    .map_or(false, |a| a.contains(RelativeAxisType::REL_X));
                 let has_button = d
                     .supported_keys()
                     .map_or(false, |k| k.contains(evdev::Key::BTN_LEFT));
@@ -275,30 +336,62 @@ fn spawn_mouse_reader(state: web::Data<AppState>) {
             let (path, mut dev) = match found {
                 Some(x) => x,
                 None => {
-                    eprintln!("mouse: no pointer device found; retrying...");
-                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    if !waiting_logged {
+                        eprintln!("mouse: no USB pointer connected; waiting...");
+                        waiting_logged = true;
+                    }
+                    if !diagnosed {
+                        diagnose_input_devices();
+                        diagnosed = true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
                     continue;
                 }
             };
+            waiting_logged = false;
             eprintln!(
                 "mouse: reading {} ({})",
                 dev.name().unwrap_or("?"),
                 path.display()
             );
+            let debug = std::env::var_os("PIWS_MOUSE_DEBUG").is_some();
+            let mut logged_first = false;
             loop {
                 match dev.fetch_events() {
                     Ok(events) => {
                         let mut dx = 0;
+                        let mut count = 0usize;
                         for ev in events {
+                            count += 1;
+                            if debug && !logged_first {
+                                eprintln!(
+                                    "mouse: first event type={:?} code={} value={}",
+                                    ev.event_type(),
+                                    ev.code(),
+                                    ev.value()
+                                );
+                                logged_first = true;
+                            }
                             match ev.event_type() {
                                 EvType::RELATIVE if ev.code() == RelativeAxisType::REL_X.0 => {
                                     dx += ev.value();
+
+                                    if debug {
+                                        println!("mouse moved: {}", ev.value());
+                                    }
                                 }
                                 EvType::KEY if ev.code() == evdev::Key::BTN_LEFT.0 => {
                                     state.left_held.store(ev.value() != 0, Ordering::Relaxed);
+
+                                    if debug {
+                                        println!("mouse left button: {}", ev.value() != 0);
+                                    }
                                 }
                                 _ => {}
                             }
+                        }
+                        if debug && count > 0 {
+                            eprintln!("mouse: fetch got {count} event(s), dx={dx}");
                         }
                         apply_mouse_dx(&state, dx);
                     }
@@ -392,7 +485,7 @@ async fn main() -> std::io::Result<()> {
     spawn_drift(state.clone());
     spawn_logger(state.clone());
 
-    let addr = ("0.0.0.0", 8080);
+    let addr = ("0.0.0.0", 7777);
     println!(
         "piwebserver: controls (n1,n2) http://localhost:{}/api/controls",
         addr.1
