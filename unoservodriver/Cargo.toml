@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+avr-device = "0.8.1"
 panic-halt = "1.0"
 
 [dependencies.arduino-hal]
