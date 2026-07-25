@@ -2,17 +2,13 @@ use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::peripherals::WIFI;
+use esp_hal::rng::Rng;
 use esp_hal::timer::timg::TimerGroup;
-use esp_radio::wifi::WifiController;
 
 pub struct HardwareControls {
-    pub wifi: WifiState,
     pub led: Output<'static>,
-}
-
-pub enum WifiState {
-    NotConnected(WIFI<'static>),
-    Connected(WifiController<'static>),
+    pub wifi: Option<WIFI<'static>>,
+    pub rng: Rng,
 }
 
 pub fn initialise_hardware() -> HardwareControls {
@@ -28,7 +24,8 @@ pub fn initialise_hardware() -> HardwareControls {
     let led = Output::new(peripherals.GPIO2, Level::Low, OutputConfig::default());
 
     HardwareControls {
-        wifi: WifiState::NotConnected(peripherals.WIFI),
         led,
+        wifi: Some(peripherals.WIFI),
+        rng: Rng::new(),
     }
 }

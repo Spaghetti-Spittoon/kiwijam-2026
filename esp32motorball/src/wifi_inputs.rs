@@ -1,6 +1,9 @@
 use crate::wifi_connection::{ConnectionControls, HttpConnection};
+use esp_println::println;
+use reqwless::headers::ContentType;
+use reqwless::request::{Method, RequestBuilder};
 
-const IP_AND_PORT: &str = env!("SERVER_IP_AND_PORT");
+const URL: &str = concat!("http://", env!("SERVER_IP_AND_PORT"), "/api/motor");
 
 pub struct ServerResult {
     pub motor_action: MotorAction,
@@ -22,7 +25,7 @@ pub async fn poll_server(connection: &mut ConnectionControls) -> ServerResult {
     let mut led = LedAction::Off;
 
     let client = match &mut connection.http {
-        HttpConnection::Connected(client) => client,
+        HttpConnection::Connected(client) => &mut **client,
         HttpConnection::NotConnected => {
             return ServerResult {
                 motor_action: motor,
@@ -32,12 +35,11 @@ pub async fn poll_server(connection: &mut ConnectionControls) -> ServerResult {
     };
 
     let mut response_buffer = [0u8; 1024];
-    let url = format!("{}/api/motor", IP_AND_PORT);
-    println!("{}", url);
 
-    let request = match client.request(Method::GET, &url).await {
-        Ok(r) => r,
-        Err(_) => {
+    let mut handle = match client.request(Method::GET, URL).await {
+        Ok(h) => h.content_type(ContentType::TextPlain),
+        Err(e) => {
+            println!("request build failed: {e:?}");
             return ServerResult {
                 motor_action: motor,
                 led_action: led,
@@ -45,13 +47,10 @@ pub async fn poll_server(connection: &mut ConnectionControls) -> ServerResult {
         }
     };
 
-    let response = match request
-        .content_type(ContentType::TextPlain)
-        .send(&mut response_buffer)
-        .await
-    {
+    let response = match handle.send(&mut response_buffer).await {
         Ok(r) => r,
-        Err(_) => {
+        Err(e) => {
+            println!("request send failed: {e:?}");
             return ServerResult {
                 motor_action: motor,
                 led_action: led,
@@ -59,37 +58,49 @@ pub async fn poll_server(connection: &mut ConnectionControls) -> ServerResult {
         }
     };
 
-    match response {
-        Response::Ok(body) => {
-            let body_str = match core::str::from_utf8(body) {
-                Ok(s) => s,
-                Err(_) => {
-                    return ServerResult {
-                        motor_action: motor,
-                        led_action: led,
-                    };
-                }
-            };
-
-            match body_str {
-                "1" => {
-                    motor = MotorAction::Start;
-                    led = LedAction::Blink;
-                }
-                "0" => {
-                    motor = MotorAction::Stop;
-                    led = LedAction::Blink;
-                }
-                _ => println!("Unknown command received: {}", body_str),
-            }
-        }
-        Response::Error(status) => {
-            println!("Error: {}", status);
-        }
+    if !response.status.is_successful() {
+        println!("http error: {:?}", response.status);
+        return ServerResult {
+            motor_action: motor,
+            led_action: led,
+        };
     }
 
-    return ServerResult {
+    let body = match response.body().read_to_end().await {
+        Ok(b) => b,
+        Err(e) => {
+            println!("body read failed: {e:?}");
+            return ServerResult {
+                motor_action: motor,
+                led_action: led,
+            };
+        }
+    };
+
+    let body_str = match core::str::from_utf8(body) {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            return ServerResult {
+                motor_action: motor,
+                led_action: led,
+            };
+        }
+    };
+
+    match body_str {
+        "1" => {
+            motor = MotorAction::Start;
+            led = LedAction::Blink;
+        }
+        "0" => {
+            motor = MotorAction::Stop;
+            led = LedAction::Blink;
+        }
+        other => println!("Unknown command received: {}", other),
+    }
+
+    ServerResult {
         motor_action: motor,
         led_action: led,
-    };
+    }
 }

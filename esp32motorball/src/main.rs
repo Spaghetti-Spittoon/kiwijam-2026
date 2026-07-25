@@ -24,9 +24,9 @@ use crate::wifi_inputs::poll_server;
 esp_bootloader_esp_idf::esp_app_desc!();
 
 #[esp_rtos::main]
-async fn main(_spawner: Spawner) -> ! {
+async fn main(spawner: Spawner) -> ! {
     let hardware = initialise_hardware();
-    let (mut hardware, mut connection) = connect_wifi(hardware).await;
+    let (mut hardware, mut connection) = connect_wifi(spawner, hardware).await;
 
     println!("motorball online");
 
