@@ -1,7 +1,4 @@
-use crate::hardware_initialisation::HardwareControls;
-use crate::wifi_connection::ConnectionControls;
-use crate::motor_driver::MotorAction;
-use crate::led_driver::LedAction;
+use crate::wifi_connection::{ConnectionControls, HttpConnection};
 
 const IP_AND_PORT: &str = env!("SERVER_IP_AND_PORT");
 
@@ -20,30 +17,69 @@ pub enum LedAction {
     Blink,
 }
 
-pub async fn poll_server(connection: ConnectionControls) -> ServerResult {
+pub async fn poll_server(connection: &mut ConnectionControls) -> ServerResult {
     let mut motor = MotorAction::Stop;
     let mut led = LedAction::Off;
+
+    let client = match &mut connection.http {
+        HttpConnection::Connected(client) => client,
+        HttpConnection::NotConnected => {
+            return ServerResult {
+                motor_action: motor,
+                led_action: led,
+            };
+        }
+    };
 
     let mut response_buffer = [0u8; 1024];
     let url = format!("{}/api/motor", IP_AND_PORT);
     println!("{}", url);
 
-    let response = client
-        .request(Method::GET, &url)
-        .await
-        .unwrap()
+    let request = match client.request(Method::GET, &url).await {
+        Ok(r) => r,
+        Err(_) => {
+            return ServerResult {
+                motor_action: motor,
+                led_action: led,
+            };
+        }
+    };
+
+    let response = match request
         .content_type(ContentType::TextPlain)
         .send(&mut response_buffer)
         .await
-        .unwrap();
+    {
+        Ok(r) => r,
+        Err(_) => {
+            return ServerResult {
+                motor_action: motor,
+                led_action: led,
+            };
+        }
+    };
 
     match response {
         Response::Ok(body) => {
-            let body_str = core::str::from_utf8(body).unwrap();
+            let body_str = match core::str::from_utf8(body) {
+                Ok(s) => s,
+                Err(_) => {
+                    return ServerResult {
+                        motor_action: motor,
+                        led_action: led,
+                    };
+                }
+            };
 
             match body_str {
-                "1" => motor = MotorAction::Start,
-                "0" => motor = MotorAction::Stop,
+                "1" => {
+                    motor = MotorAction::Start;
+                    led = LedAction::Blink;
+                }
+                "0" => {
+                    motor = MotorAction::Stop;
+                    led = LedAction::Blink;
+                }
                 _ => println!("Unknown command received: {}", body_str),
             }
         }
