@@ -6,15 +6,10 @@ edition = "2024"
 [dependencies]
 actix-web = "4.14.0"
 serde = { version = "1", features = ["derive"] }
-# Reads the Xbox controller directly on the (headless) Pi via evdev; also works
-# on Windows (XInput) for local testing.
 gilrs = "0.11"
 
-# Direct mouse reading (P1), per platform.
-# Linux/Pi: evdev reads /dev/input relative movement (headless-friendly, pure Rust).
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.12"
 
-# Windows: poll the cursor position via Win32 and take deltas.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
