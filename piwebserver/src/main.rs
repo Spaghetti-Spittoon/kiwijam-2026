@@ -1,47 +1,38 @@
 //! Raspberry Pi sensor-input web server (actix-web).
 //!
-//! Reads controller / mouse X-axis input, stores the latest RAW value per player
-//! in memory, and serves an entangled "steering" angle in the 0..180 range
-//! (90 = centre) over HTTP. Two effects shape the served value:
-//!   1. Opponent coupling (the core "Quantum Entanglement"): each player's angle
-//!      is nudged in the OPPOSITE direction of the opponent's deviation.
-//!   2. A gentle wandering drift per player: the neutral point slowly strays off
-//!      90, so a centred stick isn't always exactly 90 and "turning left" can
-//!      read slightly right — quantum uncertainty for flavour.
+//! Two players:
+//!   * P1 = MOUSE  — a minimal browser page posts the mouse X position.
+//!   * P2 = Xbox CONTROLLER — read server-side via gilrs.
 //!
-//! Headless: there is no browser client. Input comes from the Xbox controller(s)
-//! read directly on the machine (server-side), or the HTTP `/input` endpoints.
-//! We do NOT send TTL to the Uno — the web server *is* the controller-data source.
+//! Each player's steering is served as an integer 0..255 (128 = centre), shaped
+//! by opponent coupling ("Quantum Entanglement") plus a gentle wandering drift.
+//! `/api/controls` returns PLAIN TEXT "n1,n2" (no JSON).
 //!
 //! Endpoints:
-//!   GET  /                   -> plain-text status
+//!   GET  /                   -> minimal mouse-capture page (drives P1)
 //!   POST /input/{p1|p2}      -> body {"x": -1.0..1.0}; store RAW input
-//!   GET  /api/controls       -> {"p1": deg, "p2": deg}  0..180, 90=centre
-//!   GET  /api/motor          -> {"motor": "start"|"stop"}
-//!   POST /motor/{start|stop} -> set run/stop
-//!
-//! `MotorAction` mirrors `esp8266motorball::wifi_inputs::MotorAction` (the ESP's
-//! `poll_server()` contract), kept in sync by hand — branches aren't merged.
+//!   GET  /api/controls       -> "n1,n2"   (0..255, 128 = centre) plain text
+//!   GET  /api/motor          -> "0" (stop) | "1" (start)   plain text
+//!   POST /motor/{start|stop} -> set run/stop, returns "0"|"1"
 
 use std::sync::Mutex;
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
 use gilrs::{Axis, Button, Event, EventType, Gamepad, Gilrs};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-/// How strongly a control tugs the opposing player's angle the opposite way.
+/// How strongly a control tugs the opposing player's value the opposite way.
 const ENTANGLE: f32 = 0.15;
 /// Ignore small resting-stick drift near centre.
 const DEADZONE: f32 = 0.12;
 
-/// Served-angle geometry: 0..180 degrees, 90 = neutral, full stick = +/-90.
-const CENTER: f32 = 90.0;
-const SPAN: f32 = 90.0;
+/// Served value geometry: 0..255, 128 = neutral, full deflection = +/-127.5.
+const CENTER: f32 = 127.5;
+const SPAN: f32 = 127.5;
 
-/// Wandering-drift bounds (degrees). Set DRIFT_MAX = 0.0 for pure coupling.
-const DRIFT_MAX: f32 = 15.0;
-/// Random-walk step per tick (degrees) and pull-back toward centre.
-const DRIFT_STEP: f32 = 1.5;
+/// Wandering-drift bounds (value units). Set DRIFT_MAX = 0.0 for pure coupling.
+const DRIFT_MAX: f32 = 21.0;
+const DRIFT_STEP: f32 = 2.0;
 const DRIFT_DECAY: f32 = 0.97;
 const DRIFT_TICK_MS: u64 = 120;
 
@@ -53,10 +44,11 @@ enum MotorAction {
 }
 
 impl MotorAction {
-    fn as_str(self) -> &'static str {
+    /// Wire value: 0 = stop, 1 = start.
+    fn as_num(self) -> u8 {
         match self {
-            MotorAction::Start => "start",
-            MotorAction::Stop => "stop",
+            MotorAction::Start => 1,
+            MotorAction::Stop => 0,
         }
     }
 }
@@ -68,18 +60,11 @@ struct Controls {
     p2: f32,
 }
 
-/// Slowly wandering neutral-point offset per player, in degrees.
+/// Slowly wandering neutral-point offset per player, in value units.
 #[derive(Clone, Copy, Default)]
 struct Drift {
     p1: f32,
     p2: f32,
-}
-
-/// Entangled steering angle served to clients/devices (0..180, 90 = centre).
-#[derive(Serialize)]
-struct ControlsOut {
-    p1: i32,
-    p2: i32,
 }
 
 struct AppState {
@@ -93,37 +78,26 @@ struct AxisInput {
     x: f32,
 }
 
-#[derive(Serialize)]
-struct MotorStatus {
-    motor: &'static str,
-}
-
 fn clamp_axis(v: f32) -> f32 {
     if v.is_nan() { 0.0 } else { v.clamp(-1.0, 1.0) }
 }
 
-/// Raw stick (-1..1) -> steering angle in degrees (0..180).
-fn to_deg(x: f32) -> f32 {
+/// Raw stick (-1..1) -> value in 0..255 (128 = centre).
+fn to_value(x: f32) -> f32 {
     CENTER + x * SPAN
 }
 
-fn clamp_deg(v: f32) -> i32 {
-    v.clamp(0.0, 180.0).round() as i32
+fn clamp_value(v: f32) -> i32 {
+    v.clamp(0.0, 255.0).round() as i32
 }
 
-/// Combine the two effects into the served angles:
-///   * add each player's wandering drift to their own angle, then
-///   * apply opponent coupling (the core entanglement): nudge opposite to the
-///     opponent's deviation from centre.
-fn entangled(raw: Controls, drift: Drift) -> ControlsOut {
-    let b1 = to_deg(raw.p1) + drift.p1;
-    let b2 = to_deg(raw.p2) + drift.p2;
+/// Combine drift + opponent coupling; returns the two served values (0..255).
+fn entangled(raw: Controls, drift: Drift) -> (i32, i32) {
+    let b1 = to_value(raw.p1) + drift.p1;
+    let b2 = to_value(raw.p2) + drift.p2;
     let o1 = CENTER + (b1 - CENTER) - ENTANGLE * (b2 - CENTER);
     let o2 = CENTER + (b2 - CENTER) - ENTANGLE * (b1 - CENTER);
-    ControlsOut {
-        p1: clamp_deg(o1),
-        p2: clamp_deg(o2),
-    }
+    (clamp_value(o1), clamp_value(o2))
 }
 
 /// Tiny xorshift64 PRNG — enough for gentle drift without a `rand` dependency.
@@ -177,6 +151,12 @@ fn spawn_drift(state: web::Data<AppState>) {
     });
 }
 
+fn plain(body: String) -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("text/plain; charset=utf-8")
+        .body(body)
+}
+
 /// Store a player's RAW X-axis; drift + entanglement are applied when read.
 #[post("/input/{player}")]
 async fn set_input(
@@ -195,27 +175,27 @@ async fn set_input(
         *c
     };
     let drift = *data.drift.lock().unwrap();
-    HttpResponse::Ok().json(entangled(raw, drift))
+    let (n1, n2) = entangled(raw, drift);
+    plain(format!("{n1},{n2}"))
 }
 
-/// Controller data the device polls (instead of receiving TTL).
+/// Controller data the device polls: PLAIN TEXT "n1,n2" (0..255, 128 = centre).
 #[get("/api/controls")]
 async fn api_controls(data: web::Data<AppState>) -> impl Responder {
     let raw = *data.controls.lock().unwrap();
     let drift = *data.drift.lock().unwrap();
-    web::Json(entangled(raw, drift))
+    let (n1, n2) = entangled(raw, drift);
+    plain(format!("{n1},{n2}"))
 }
 
-/// Whether the motorball should run or stop.
+/// Whether the motorball should run: PLAIN TEXT "0" (stop) or "1" (start).
 #[get("/api/motor")]
 async fn api_motor(data: web::Data<AppState>) -> impl Responder {
     let action = *data.motor.lock().unwrap();
-    web::Json(MotorStatus {
-        motor: action.as_str(),
-    })
+    plain(action.as_num().to_string())
 }
 
-/// Set run/stop.
+/// Set run/stop; returns the new value ("0"|"1").
 #[post("/motor/{action}")]
 async fn set_motor(path: web::Path<String>, data: web::Data<AppState>) -> impl Responder {
     let new = match path.into_inner().as_str() {
@@ -226,9 +206,7 @@ async fn set_motor(path: web::Path<String>, data: web::Data<AppState>) -> impl R
     match new {
         Some(action) => {
             *data.motor.lock().unwrap() = action;
-            HttpResponse::Ok().json(MotorStatus {
-                motor: action.as_str(),
-            })
+            plain(action.as_num().to_string())
         }
         None => HttpResponse::BadRequest().body("unknown motor action (use start|stop)"),
     }
@@ -250,10 +228,8 @@ fn steer(pad: &Gamepad, stick: Axis, left: Button, right: Button) -> f32 {
     }
 }
 
-/// Background thread: read the Xbox controller(s) and feed X-axis into shared
-/// state. One pad: left stick / D-pad L-R -> P1, right stick / LB-RB -> P2.
-/// A second pad's left stick / D-pad overrides P2. If no input subsystem is
-/// available it logs and exits so the HTTP `/input` endpoints still work.
+/// Background thread: read the Xbox controller and drive Player 2 (P1 is the
+/// mouse). Logs connects/disconnects/buttons/axes for diagnostics.
 fn spawn_gamepad_reader(state: web::Data<AppState>) {
     std::thread::spawn(move || {
         let mut gilrs = match Gilrs::new() {
@@ -265,8 +241,6 @@ fn spawn_gamepad_reader(state: web::Data<AppState>) {
         };
         eprintln!("gamepad: reader started (waiting for a controller)");
         loop {
-            // Drain pending events so `value()`/`is_pressed()` are current, and
-            // log connects/disconnects/button presses for diagnostics.
             let mut drained = 0;
             while let Some(Event { id, event, .. }) = gilrs.next_event() {
                 match event {
@@ -286,37 +260,71 @@ fn spawn_gamepad_reader(state: web::Data<AppState>) {
                 }
             }
 
-            // Read current state into locals, THEN take the lock only to write
-            // (keeps the controls mutex held for microseconds, not starving readers).
+            // Controller drives P2 only (P1 belongs to the mouse).
             let pads: Vec<_> = gilrs.gamepads().collect();
             if let Some((_, pad0)) = pads.first() {
-                // P1: left stick, or D-pad Left/Right buttons.
-                let p1 = steer(pad0, Axis::LeftStickX, Button::DPadLeft, Button::DPadRight);
-                // P2: a second pad if present, else this pad's right stick or
-                // the LB/RB bumpers.
-                let p2 = match pads.get(1) {
-                    Some((_, pad1)) => {
-                        steer(pad1, Axis::LeftStickX, Button::DPadLeft, Button::DPadRight)
-                    }
-                    None => steer(pad0, Axis::RightStickX, Button::LeftTrigger, Button::RightTrigger),
-                };
-                let (p1, p2) = (clamp_axis(p1), clamp_axis(p2));
-                let mut c = state.controls.lock().unwrap();
-                c.p1 = p1;
-                c.p2 = p2;
+                let p2 = clamp_axis(steer(pad0, Axis::LeftStickX, Button::DPadLeft, Button::DPadRight));
+                state.controls.lock().unwrap().p2 = p2;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     });
 }
 
-/// Plain-text status root — no HTML client (this is a headless API server).
+/// Minimal mouse-capture page: mouse X position drives Player 1.
 #[get("/")]
 async fn index() -> impl Responder {
     HttpResponse::Ok()
-        .content_type("text/plain; charset=utf-8")
-        .body("piwebserver (motorball control)\nGET /api/controls  GET /api/motor\n")
+        .content_type("text/html; charset=utf-8")
+        .body(PAGE)
 }
+
+const PAGE: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>P1 Mouse Control</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; height: 100vh; background: #11151c;
+           color: #e6e6e6; display: grid; place-items: center; cursor: crosshair; }
+    .box { text-align: center; }
+    .big { font-size: 3rem; font-weight: 800; letter-spacing: .05em; }
+    .p1 { color: #7aa2f7; } .p2 { color: #f7768e; }
+    .hint { color: #6b7280; font-size: .85rem; margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <div>P1 (mouse) <span id="p1" class="big p1">128</span>
+      &nbsp;&nbsp; P2 (controller) <span id="p2" class="big p2">128</span></div>
+    <div class="hint">Move the mouse left/right to steer Player 1 (left = 0, centre = 128, right = 255).
+      Values are 0&ndash;255 at <code>/api/controls</code>.</div>
+  </div>
+<script>
+let last = 0;
+addEventListener('mousemove', e => {
+  const now = performance.now();
+  if (now - last < 50) return;          // ~20 posts/sec
+  last = now;
+  const x = (e.clientX / innerWidth) * 2 - 1;   // left edge -1, right edge +1
+  fetch('/input/p1', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ x })
+  }).catch(() => {});
+});
+async function refresh() {
+  try {
+    const t = await (await fetch('/api/controls')).text();   // "n1,n2"
+    const [n1, n2] = t.split(',');
+    document.getElementById('p1').textContent = n1;
+    document.getElementById('p2').textContent = n2;
+  } catch (e) {}
+}
+setInterval(refresh, 150);
+</script>
+</body>
+</html>"##;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -326,14 +334,13 @@ async fn main() -> std::io::Result<()> {
         drift: Mutex::new(Drift::default()),
     });
 
-    // Read the physical Xbox controller directly (server-side).
-    spawn_gamepad_reader(state.clone());
-    // Slowly wander each player's neutral point (quantum uncertainty).
+    spawn_gamepad_reader(state.clone()); // P2 = Xbox controller
     spawn_drift(state.clone());
 
     let addr = ("0.0.0.0", 8080);
-    println!("piwebserver: controls API   http://localhost:{}/api/controls", addr.1);
-    println!("             motor API      http://localhost:{}/api/motor", addr.1);
+    println!("piwebserver: P1 mouse page  http://localhost:{}/", addr.1);
+    println!("             controls (n1,n2) http://localhost:{}/api/controls", addr.1);
+    println!("             motor API        http://localhost:{}/api/motor", addr.1);
 
     HttpServer::new(move || {
         App::new()
