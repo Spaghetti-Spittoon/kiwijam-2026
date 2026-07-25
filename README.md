@@ -4,7 +4,7 @@ This project was created by Sam, Charisse, Yousongsun, Amer.
 
 ## Esp32motorball
 
-Drives the motors inside the rolling ball and can accept stop / start commands from the web server.
+Drives the motors inside the rolling ball and can accept stop / start commands from the web server. It blinks an LED on `GPIO2` every second if wifi connected and it requests to the webserver succeed.
 
 To setup a linux environment for flashing the ESP32 with the Rust firmware:
 
