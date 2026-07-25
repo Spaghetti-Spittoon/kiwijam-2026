@@ -5,4 +5,4 @@ target = "xtensa-esp8266-none-elf"
 build-std = ["core"]
 
 [target.xtensa-esp8266-none-elf]
-linker = "rust-lld" #required to use the lld linker for xtensa targets, as the default linker is not compatible with xtensa
+linker = "rust-lld"
