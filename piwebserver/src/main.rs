@@ -39,6 +39,11 @@ const DRIFT_TICK_MS: u64 = 120;
 /// How often to print the live values to the terminal.
 const LOG_TICK_MS: u64 = 500;
 
+/// Controller accumulator: how far P2's raw value moves per 20 ms while a
+/// direction is held (0.04 => centre-to-extreme in ~0.5 s). Holding left ramps
+/// to 0 even if a cheap pad only deflects the stick partially.
+const P2_RATE: f32 = 0.04;
+
 /// Whether the motorball should run. Mirrors esp8266motorball's MotorAction.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MotorAction {
@@ -215,19 +220,24 @@ async fn set_motor(path: web::Path<String>, data: web::Data<AppState>) -> impl R
     }
 }
 
-fn deadzone(x: f32) -> f32 {
-    if x.abs() < DEADZONE { 0.0 } else { x }
-}
-
-/// Steering value (-1..1) from a pad: the left/right BUTTONS give full
-/// deflection when pressed, otherwise the analog STICK axis is used.
-fn steer(pad: &Gamepad, stick: Axis, left: Button, right: Button) -> f32 {
-    if pad.is_pressed(left) {
+/// -1 = steering left, +1 = right, 0 = neutral. Reads the D-pad buttons, the
+/// D-pad axis, and the left stick, so whatever "left/right" the pad reports
+/// counts. Any deflection past the deadzone is a full direction, so a cheap
+/// partial-range pad still ramps to the extreme.
+fn pad_direction(pad: &Gamepad) -> f32 {
+    if pad.is_pressed(Button::DPadLeft) {
+        return -1.0;
+    }
+    if pad.is_pressed(Button::DPadRight) {
+        return 1.0;
+    }
+    let x = pad.value(Axis::LeftStickX) + pad.value(Axis::DPadX);
+    if x < -DEADZONE {
         -1.0
-    } else if pad.is_pressed(right) {
+    } else if x > DEADZONE {
         1.0
     } else {
-        deadzone(pad.value(stick))
+        0.0
     }
 }
 
@@ -251,8 +261,11 @@ fn spawn_gamepad_reader(state: web::Data<AppState>) {
                         eprintln!("gamepad {}: CONNECTED: {}", id, gilrs.gamepad(id).name());
                     }
                     EventType::Disconnected => eprintln!("gamepad {}: disconnected", id),
-                    EventType::ButtonPressed(b, _) => eprintln!("gamepad {}: BUTTON {:?}", id, b),
-                    EventType::AxisChanged(a, v, _) if v.abs() > 0.5 => {
+                    EventType::ButtonPressed(b, _) => eprintln!("gamepad {}: BTN {:?}", id, b),
+                    EventType::ButtonChanged(b, v, _) if v > 0.25 => {
+                        eprintln!("gamepad {}: BTN~ {:?} = {:.2}", id, b, v)
+                    }
+                    EventType::AxisChanged(a, v, _) if v.abs() > 0.25 => {
                         eprintln!("gamepad {}: AXIS {:?} = {:.2}", id, a, v)
                     }
                     _ => {}
@@ -263,11 +276,15 @@ fn spawn_gamepad_reader(state: web::Data<AppState>) {
                 }
             }
 
-            // Controller drives P2 only (P1 belongs to the mouse).
+            // Controller drives P2 as an accumulator: holding a direction ramps
+            // the value to the extreme (P1 belongs to the mouse).
             let pads: Vec<_> = gilrs.gamepads().collect();
             if let Some((_, pad0)) = pads.first() {
-                let p2 = clamp_axis(steer(pad0, Axis::LeftStickX, Button::DPadLeft, Button::DPadRight));
-                state.controls.lock().unwrap().p2 = p2;
+                let dir = pad_direction(pad0);
+                if dir != 0.0 {
+                    let mut c = state.controls.lock().unwrap();
+                    c.p2 = (c.p2 + dir * P2_RATE).clamp(-1.0, 1.0);
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
