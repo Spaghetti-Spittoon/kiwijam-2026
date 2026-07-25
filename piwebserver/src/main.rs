@@ -36,6 +36,9 @@ const DRIFT_STEP: f32 = 2.0;
 const DRIFT_DECAY: f32 = 0.97;
 const DRIFT_TICK_MS: u64 = 120;
 
+/// How often to print the live values to the terminal.
+const LOG_TICK_MS: u64 = 500;
+
 /// Whether the motorball should run. Mirrors esp8266motorball's MotorAction.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MotorAction {
@@ -271,6 +274,23 @@ fn spawn_gamepad_reader(state: web::Data<AppState>) {
     });
 }
 
+/// Background thread: print the live values to the terminal in the same shape
+/// as the two endpoints, e.g. `/api/controls: 137,110 /api/motor: 0`.
+fn spawn_logger(state: web::Data<AppState>) {
+    std::thread::spawn(move || {
+        loop {
+            let (n1, n2) = {
+                let raw = *state.controls.lock().unwrap();
+                let drift = *state.drift.lock().unwrap();
+                entangled(raw, drift)
+            };
+            let m = state.motor.lock().unwrap().as_num();
+            println!("/api/controls: {n1},{n2} /api/motor: {m}");
+            std::thread::sleep(std::time::Duration::from_millis(LOG_TICK_MS));
+        }
+    });
+}
+
 /// Minimal mouse-capture page: mouse X position drives Player 1.
 #[get("/")]
 async fn index() -> impl Responder {
@@ -336,6 +356,7 @@ async fn main() -> std::io::Result<()> {
 
     spawn_gamepad_reader(state.clone()); // P2 = Xbox controller
     spawn_drift(state.clone());
+    spawn_logger(state.clone()); // live values to the terminal
 
     let addr = ("0.0.0.0", 8080);
     println!("piwebserver: P1 mouse page  http://localhost:{}/", addr.1);
