@@ -10,7 +10,7 @@ esp-hal = { version = "1.1.1", features = ["esp32", "unstable"] }
 esp-println = { version = "0.17.0", features = ["esp32"] }
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32"] }
 esp-rtos = { version = "0.3.0", features = ["esp32", "esp-radio", "esp-alloc", "embassy"] }
-esp-radio = { version = "1.0.0-beta.0", features = ["esp32", "wifi", "esp-alloc"] }
+esp-radio = { version = "1.0.0-beta.0", features = ["esp32", "wifi", "wifi-eap", "esp-alloc", "unstable"] }
 esp-alloc = "0.10.0"
 log = "0.4.20"
 embassy-executor = "0.10.0"
