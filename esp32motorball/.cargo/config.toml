@@ -11,3 +11,6 @@ target = "xtensa-esp32-none-elf"
 
 [unstable]
 build-std = ["core", "alloc"]
+
+[term]
+progress.when = "never"
