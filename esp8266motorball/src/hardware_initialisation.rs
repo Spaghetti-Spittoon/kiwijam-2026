@@ -1,20 +1,29 @@
-use esp8266::Peripherals;
+use esp_hal::clock::CpuClock;
+use esp_hal::interrupt::software::SoftwareInterruptControl;
+use esp_hal::peripherals::WIFI;
+use esp_hal::timer::timg::TimerGroup;
+use esp_radio::wifi::WifiController;
 
 pub struct HardwareControls {
     pub wifi: WifiState,
-    pub peripherals: Peripherals,
 }
 
 pub enum WifiState {
-    NotConnected,
-    Connected,
+    NotConnected(WIFI<'static>),
+    Connected(WifiController<'static>),
 }
 
-pub fn initialise_hardware() -> Result<HardwareControls, ()> {
-    let peripherals = Peripherals::take().ok_or(())?;
+pub fn initialise_hardware() -> HardwareControls {
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    let peripherals = esp_hal::init(config);
 
-    Ok(HardwareControls {
-        wifi: WifiState::NotConnected,
-        peripherals,
-    })
+    esp_alloc::heap_allocator!(size: 72 * 1024);
+
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+
+    HardwareControls {
+        wifi: WifiState::NotConnected(peripherals.WIFI),
+    }
 }

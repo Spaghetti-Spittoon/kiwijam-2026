@@ -13,7 +13,7 @@ pub enum LedAction {
     Blink,
 }
 
-pub fn poll_server() -> ServerResult {
+pub async fn poll_server() -> ServerResult {
     ServerResult {
         motor_action: MotorAction::Start,
         led_action: LedAction::Blink,

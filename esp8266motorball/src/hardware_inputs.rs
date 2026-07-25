@@ -6,6 +6,6 @@ pub enum TiltSensation {
     TiltingBack,
 }
 
-pub fn read_tilt_sensor() -> TiltSensation {
+pub async fn read_tilt_sensor() -> TiltSensation {
     TiltSensation::Idle
 }
