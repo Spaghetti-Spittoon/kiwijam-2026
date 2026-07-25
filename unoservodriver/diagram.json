@@ -4,15 +4,41 @@
   "editor": "wokwi",
   "parts": [
     { "type": "wokwi-arduino-uno", "id": "uno", "top": 0, "left": 0, "attrs": {} },
-    { "type": "wokwi-servo", "id": "servo1", "top": -110, "left": 200, "attrs": {} }
+    { "type": "wokwi-servo", "id": "servo1", "top": -110, "left": 200, "attrs": {} },
+    {
+      "type": "wokwi-logic-analyzer",
+      "id": "logic1",
+      "top": 130,
+      "left": 300,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-text",
+      "id": "pinInfo",
+      "top": -190,
+      "left": -20,
+      "attrs": {
+        "text": "UNO SERVO DRIVER\nD2  <- Pi control: 50 Hz, 1000-2000 us HIGH\nD9  -> Servo PWM\nD13 -> Valid-input status (onboard LED)\nD0/D1 UART: reserved, currently unused"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "controlInfo",
+      "top": 110,
+      "left": -20,
+      "attrs": {
+        "text": "D2 is an external 3.3 V Pi signal.\nHardware requires shared GND and a validated\n3.3 V-to-5 V level shifter/buffer.\nWith D2 disconnected, servo safely stays centered."
+      }
+    }
   ],
   "connections": [
     [ "servo1:PWM", "uno:9", "green", [ "h0" ] ],
     [ "servo1:V+", "uno:5V", "red", [ "h0" ] ],
     [ "servo1:GND", "uno:GND.1", "black", [ "h0" ] ],
-    [ "uno:TX", "$serialMonitor:RX", "", [] ],
-    [ "uno:RX", "$serialMonitor:TX", "", [] ]
+    [ "logic1:D0", "uno:2", "blue", [ "h-60", "v-20" ] ],
+    [ "logic1:D1", "uno:9", "green", [ "h-40", "v-40" ] ],
+    [ "logic1:D2", "uno:13", "orange", [ "h-20", "v-60" ] ],
+    [ "logic1:GND", "uno:GND.2", "black", [ "h-80" ] ]
   ],
-  "serialMonitor": { "display": "terminal", "convertEol": true },
   "dependencies": {}
 }

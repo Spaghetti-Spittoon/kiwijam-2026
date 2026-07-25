@@ -14,6 +14,8 @@
 //!   GPIO to the Uno without it.
 //! - Uno D9 -> servo signal; power the servo from an appropriately rated 5 V
 //!   supply and connect that supply's ground to Uno/Pi ground.
+//! - Uno D13 -> onboard status LED; ON means the last sampled D2 pulse was
+//!   valid, and OFF means the input timed out or contained an invalid width.
 //! - A 3.3 V Pi GPIO is not guaranteed to meet the ATmega328P's HIGH threshold
 //!   when the Uno runs at 5 V.  The final circuit therefore needs a validated
 //!   3.3 V-to-5 V level shifter/buffer (or a confirmed 3.3 V Uno design).
@@ -21,6 +23,11 @@
 //! Do not treat D2 as a TTL/UART serial input: it measures servo-style PWM.
 //! If the intended Pi protocol is UART, I2C, or separate direction buttons,
 //! this interface and wiring need to be redesigned.
+//!
+//! The merged ESP template also referred to GPIO1 (TX) and GPIO3 (RX).  Those
+//! are ESP UART0 assignments, not Arduino Uno UART assignments.  On the Uno,
+//! hardware serial would use D1/TX and D0/RX; neither is used by this PWM
+//! control implementation.
 
 #![no_std]
 #![no_main]
@@ -73,10 +80,11 @@ fn main() -> ! {
     let dp = arduino_hal::Peripherals::take().unwrap();
     let pins = arduino_hal::pins!(dp);
 
-    // Servo signal on D9.  D2 is the provisional Pi PWM-control input; see
-    // the module documentation before wiring it to physical hardware.
+    // Servo signal on D9.  D2 is the provisional Pi PWM-control input, and
+    // D13 retains the merged template's LED pin as a signal-valid indicator.
     let mut servo = pins.d9.into_output();
     let control = pins.d2.into_floating_input();
+    let mut status_led = pins.d13.into_output();
 
     // Fail-safe position for a missing or malformed control signal.  This
     // should be reviewed with the mechanical team: “centre” is not always the
@@ -86,6 +94,9 @@ fn main() -> ! {
     loop {
         if let Some(control_us) = read_control_pulse_us(&control) {
             servo_us = control_to_servo_us(control_us);
+            status_led.set_high();
+        } else {
+            status_led.set_low();
         }
 
         // One 20 ms servo frame: HIGH for the pulse width, LOW for the rest.

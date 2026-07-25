@@ -1,0 +1,37 @@
+[package]
+name = "esp8266motorball"
+version = "0.1.0"
+edition = "2024"
+resolver = "2"
+
+[dependencies]
+esp-backtrace = { version = "0.19.0", features = ["esp32", "panic-handler", "println"] }
+esp-hal = { version = "1.1.1", features = ["esp32", "unstable"] }
+esp-println = { version = "0.17.0", features = ["esp32"] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32"] }
+esp-rtos = { version = "0.3.0", features = ["esp32", "esp-radio", "esp-alloc", "embassy"] }
+esp-radio = { version = "1.0.0-beta.0", features = ["esp32", "wifi", "esp-alloc"] }
+esp-alloc = "0.10.0"
+log = "0.4.20"
+embassy-executor = "0.10.0"
+embassy-futures = "0.1.1"
+embassy-sync = "0.8.0"
+embassy-time = "0.5.0"
+static_cell = "2.1.0"
+
+[build-dependencies]
+libc = "0.2"
+
+[profile.dev]
+opt-level = "s"
+panic = "abort"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+debug-assertions = false
+incremental = false
+lto = "fat"
+opt-level = "s"
+overflow-checks = false
+panic = "abort"
