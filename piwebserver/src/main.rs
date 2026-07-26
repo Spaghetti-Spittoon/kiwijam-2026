@@ -21,7 +21,7 @@ const DRIFT_TICK_MS: u64 = 120;
 const LOG_TICK_MS: u64 = 500;
 const P2_RATE: f32 = 0.03;
 const MOUSE_RATE: f32 = 0.00025;
-const CLICK_RATE: f32 = 0.04;
+const CLICK_RATE: f32 = 0.03;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MotorAction {
@@ -55,6 +55,7 @@ struct AppState {
     controls: Mutex<Controls>,
     drift: Mutex<Drift>,
     left_held: AtomicBool,
+    right_held: AtomicBool,
 }
 
 #[derive(Deserialize)]
@@ -208,6 +209,14 @@ fn input_direction(left: bool, right: bool, axes: [f32; 3]) -> f32 {
         1.0
     } else {
         0.0
+    }
+}
+
+fn mouse_button_direction(left: bool, right: bool) -> f32 {
+    match (left, right) {
+        (true, false) => -1.0,
+        (false, true) => 1.0,
+        _ => 0.0,
     }
 }
 
@@ -411,6 +420,13 @@ fn spawn_mouse_reader(state: web::Data<AppState>) {
                                         println!("mouse left button: {}", ev.value() != 0);
                                     }
                                 }
+                                EvType::KEY if ev.code() == evdev::Key::BTN_RIGHT.0 => {
+                                    state.right_held.store(ev.value() != 0, Ordering::Relaxed);
+
+                                    if debug {
+                                        println!("mouse right button: {}", ev.value() != 0);
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -436,6 +452,7 @@ fn spawn_mouse_reader(state: web::Data<AppState>) {
         use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
         use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
         const VK_LBUTTON: i32 = 0x01;
+        const VK_RBUTTON: i32 = 0x02;
         eprintln!("mouse: polling cursor position");
         let mut last: Option<i32> = None;
         loop {
@@ -446,8 +463,10 @@ fn spawn_mouse_reader(state: web::Data<AppState>) {
                 }
                 last = Some(p.x);
             }
-            let held = (unsafe { GetAsyncKeyState(VK_LBUTTON) } as u16 & 0x8000) != 0;
-            state.left_held.store(held, Ordering::Relaxed);
+            let left = (unsafe { GetAsyncKeyState(VK_LBUTTON) } as u16 & 0x8000) != 0;
+            let right = (unsafe { GetAsyncKeyState(VK_RBUTTON) } as u16 & 0x8000) != 0;
+            state.left_held.store(left, Ordering::Relaxed);
+            state.right_held.store(right, Ordering::Relaxed);
             std::thread::sleep(std::time::Duration::from_millis(8));
         }
     });
@@ -461,9 +480,13 @@ fn spawn_mouse_reader(_state: web::Data<AppState>) {
 fn spawn_mouse_button_ramp(state: web::Data<AppState>) {
     std::thread::spawn(move || {
         loop {
-            if state.left_held.load(Ordering::Relaxed) {
+            let direction = mouse_button_direction(
+                state.left_held.load(Ordering::Relaxed),
+                state.right_held.load(Ordering::Relaxed),
+            );
+            if direction != 0.0 {
                 let mut c = state.controls.lock().unwrap();
-                c.p1 = (c.p1 - CLICK_RATE).clamp(-1.0, 1.0);
+                c.p1 = (c.p1 + direction * CLICK_RATE).clamp(-1.0, 1.0);
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -501,6 +524,7 @@ async fn main() -> std::io::Result<()> {
         controls: Mutex::new(Controls { p1: 0.0, p2: 0.0 }),
         drift: Mutex::new(Drift::default()),
         left_held: AtomicBool::new(false),
+        right_held: AtomicBool::new(false),
     });
 
     spawn_mouse_reader(state.clone());
@@ -541,7 +565,7 @@ async fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::input_direction;
+    use super::{input_direction, mouse_button_direction};
 
     #[test]
     fn face_buttons_drive_both_directions() {
@@ -555,5 +579,13 @@ mod tests {
         assert_eq!(input_direction(false, false, [0.2, -0.8, 0.0]), -1.0);
         assert_eq!(input_direction(false, false, [0.2, 0.4, 0.9]), 1.0);
         assert_eq!(input_direction(false, false, [0.01, -0.02, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn mouse_buttons_drive_opposite_directions() {
+        assert_eq!(mouse_button_direction(true, false), -1.0);
+        assert_eq!(mouse_button_direction(false, true), 1.0);
+        assert_eq!(mouse_button_direction(true, true), 0.0);
+        assert_eq!(mouse_button_direction(false, false), 0.0);
     }
 }
