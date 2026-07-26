@@ -90,10 +90,13 @@ off:
 - OLED SDA to physical pin 3 (GPIO2/SDA1)
 - OLED SCL to physical pin 5 (GPIO3/SCL1)
 
-I2C must be enabled with `dtparam=i2c_arm=on` in `/boot/config.txt`. The display
-shows `READY`, the active game's seconds, the 10-second `CHAOS` phase, and
-`GAME OVER`. It reconnects automatically after an I2C error. Override the
-default bus device with `PIWS_OLED_I2C` if needed.
+I2C must be enabled with `dtparam=i2c_arm=on` in `/boot/config.txt`. The OLED
+runs a miniature Pong game during the active round: Player 1 and Player 2
+values control the left and right paddles, while the score and remaining
+seconds appear across the top. Pong continues through the 10-second `CHAOS`
+phase and leaves the final score on `GAME OVER`. It reconnects automatically
+after an I2C error. Override the default bus device with `PIWS_OLED_I2C` if
+needed.
 
 For a non-root service, add its user to the `dialout` group.
 
