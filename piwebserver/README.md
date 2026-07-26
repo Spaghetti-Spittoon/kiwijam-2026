@@ -43,6 +43,39 @@ ls -l /dev/serial/by-id/
 ```
 
 The service currently runs as root and therefore has serial-device permission.
+
+## Game countdown
+
+Hold the controller button reported by `gilrs` as `West` (the physical Y button
+on the project controller) firmly for five continuous seconds to start or
+restart a game. One hold can trigger only once; release Y before starting
+another game. A game lasts 60 seconds by default, starts the motor, and stops
+the motor when time expires.
+
+Read the current timer state:
+
+```bash
+curl http://localhost:7777/api/countdown
+```
+
+Start a game without the controller:
+
+```bash
+curl -X POST http://localhost:7777/game/start
+```
+
+The JSON response includes `state`, `remaining_seconds`, `duration_seconds`,
+and the incrementing `game` number. The periodic service log reports controls,
+motor state, and `/api/countdown` together on one line. Game start and finish
+events are also logged:
+
+```bash
+journalctl -u piwebserver -f
+```
+
+Set a different game duration in the systemd service with, for example,
+`Environment=PIWS_GAME_SECONDS=90`, then run `systemctl daemon-reload` and
+restart the service.
 For a non-root service, add its user to the `dialout` group.
 
 The earlier GPIO PWM transport is no longer used. `dtoverlay=pwm-2chan` and
