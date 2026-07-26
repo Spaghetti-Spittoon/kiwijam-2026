@@ -26,6 +26,9 @@ const CLICK_RATE: f32 = 0.03;
 const DEFAULT_GAME_SECONDS: u64 = 60;
 const HARD_PRESS_THRESHOLD: f32 = 0.75;
 const START_HOLD_SECONDS: u64 = 5;
+const CHAOS_SECONDS: u64 = 10;
+const CHAOS_MIN_INTERVAL_MS: u64 = 200;
+const CHAOS_INTERVAL_RANGE_MS: u64 = 601;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MotorAction {
@@ -58,6 +61,7 @@ struct Drift {
 struct Countdown {
     duration_seconds: u64,
     deadline: Option<Instant>,
+    chaos_deadline: Option<Instant>,
     game: u64,
 }
 
@@ -127,25 +131,34 @@ fn seconds_remaining(deadline: Instant, now: Instant) -> u64 {
 }
 
 fn countdown_status(countdown: Countdown, now: Instant) -> CountdownStatus {
-    match countdown.deadline {
-        Some(deadline) if deadline > now => CountdownStatus {
+    if let Some(deadline) = countdown.deadline.filter(|deadline| *deadline > now) {
+        CountdownStatus {
             state: "running",
             remaining_seconds: seconds_remaining(deadline, now),
             duration_seconds: countdown.duration_seconds,
             game: countdown.game,
-        },
-        _ if countdown.game > 0 => CountdownStatus {
+        }
+    } else if let Some(deadline) = countdown.chaos_deadline.filter(|deadline| *deadline > now) {
+        CountdownStatus {
+            state: "chaos",
+            remaining_seconds: seconds_remaining(deadline, now),
+            duration_seconds: countdown.duration_seconds,
+            game: countdown.game,
+        }
+    } else if countdown.game > 0 {
+        CountdownStatus {
             state: "finished",
             remaining_seconds: 0,
             duration_seconds: countdown.duration_seconds,
             game: countdown.game,
-        },
-        _ => CountdownStatus {
+        }
+    } else {
+        CountdownStatus {
             state: "idle",
             remaining_seconds: 0,
             duration_seconds: countdown.duration_seconds,
             game: 0,
-        },
+        }
     }
 }
 
@@ -158,6 +171,7 @@ fn start_game(state: &AppState, source: &str) -> CountdownStatus {
         let mut countdown = state.countdown.lock().unwrap();
         countdown.game = countdown.game.saturating_add(1);
         countdown.deadline = Some(Instant::now() + Duration::from_secs(countdown.duration_seconds));
+        countdown.chaos_deadline = None;
         countdown_status(*countdown, Instant::now())
     };
     *state.motor.lock().unwrap() = MotorAction::Start;
@@ -200,6 +214,18 @@ impl Rng {
     fn signed_unit(&mut self) -> f32 {
         let u = (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32;
         u * 2.0 - 1.0
+    }
+}
+
+fn next_chaos_interval(rng: &mut Rng) -> Duration {
+    Duration::from_millis(CHAOS_MIN_INTERVAL_MS + rng.next_u64() % CHAOS_INTERVAL_RANGE_MS)
+}
+
+fn random_motor_action(rng: &mut Rng) -> MotorAction {
+    if rng.next_u64() & 1 == 0 {
+        MotorAction::Stop
+    } else {
+        MotorAction::Start
     }
 }
 
@@ -611,21 +637,52 @@ fn spawn_mouse_button_ramp(state: web::Data<AppState>) {
 
 fn spawn_countdown(state: web::Data<AppState>) {
     std::thread::spawn(move || {
+        enum Update {
+            None,
+            StartChaos(u64),
+            ChangeMotor,
+            FinishChaos(u64),
+        }
+
+        let mut rng = Rng::from_time();
+        let mut next_motor_change = Instant::now();
         loop {
-            let expired_game = {
+            let now = Instant::now();
+            let update = {
                 let mut countdown = state.countdown.lock().unwrap();
-                match countdown.deadline {
-                    Some(deadline) if deadline <= Instant::now() => {
-                        countdown.deadline = None;
-                        Some(countdown.game)
-                    }
-                    _ => None,
+                if countdown.deadline.is_some_and(|deadline| deadline <= now) {
+                    countdown.deadline = None;
+                    countdown.chaos_deadline = Some(now + Duration::from_secs(CHAOS_SECONDS));
+                    Update::StartChaos(countdown.game)
+                } else if countdown
+                    .chaos_deadline
+                    .is_some_and(|deadline| deadline <= now)
+                {
+                    countdown.chaos_deadline = None;
+                    Update::FinishChaos(countdown.game)
+                } else if countdown.chaos_deadline.is_some() && now >= next_motor_change {
+                    Update::ChangeMotor
+                } else {
+                    Update::None
                 }
             };
 
-            if let Some(game) = expired_game {
-                *state.motor.lock().unwrap() = MotorAction::Stop;
-                println!("countdown: game {game} finished; motor stopped");
+            match update {
+                Update::StartChaos(game) => {
+                    let motor = random_motor_action(&mut rng);
+                    *state.motor.lock().unwrap() = motor;
+                    next_motor_change = now + next_chaos_interval(&mut rng);
+                    println!("countdown: game {game} ended; starting {CHAOS_SECONDS}s chaos phase");
+                }
+                Update::ChangeMotor => {
+                    *state.motor.lock().unwrap() = random_motor_action(&mut rng);
+                    next_motor_change = now + next_chaos_interval(&mut rng);
+                }
+                Update::FinishChaos(game) => {
+                    *state.motor.lock().unwrap() = MotorAction::Stop;
+                    println!("countdown: game {game} chaos finished; motor stopped");
+                }
+                Update::None => {}
             }
 
             std::thread::sleep(Duration::from_millis(100));
@@ -677,6 +734,7 @@ async fn main() -> std::io::Result<()> {
         countdown: Mutex::new(Countdown {
             duration_seconds: game_seconds,
             deadline: None,
+            chaos_deadline: None,
             game: 0,
         }),
         left_held: AtomicBool::new(false),
@@ -771,6 +829,7 @@ mod tests {
         let mut countdown = Countdown {
             duration_seconds: 60,
             deadline: None,
+            chaos_deadline: None,
             game: 0,
         };
         assert_eq!(countdown_status(countdown, now).state, "idle");
@@ -781,6 +840,11 @@ mod tests {
         assert_eq!(countdown_status(countdown, now).remaining_seconds, 30);
 
         countdown.deadline = None;
+        countdown.chaos_deadline = Some(now + Duration::from_secs(10));
+        assert_eq!(countdown_status(countdown, now).state, "chaos");
+        assert_eq!(countdown_status(countdown, now).remaining_seconds, 10);
+
+        countdown.chaos_deadline = None;
         assert_eq!(countdown_status(countdown, now).state, "finished");
     }
 

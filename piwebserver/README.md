@@ -49,8 +49,10 @@ The service currently runs as root and therefore has serial-device permission.
 Hold the controller button reported by `gilrs` as `West` (the physical Y button
 on the project controller) firmly for five continuous seconds to start or
 restart a game. One hold can trigger only once; release Y before starting
-another game. A game lasts 60 seconds by default, starts the motor, and stops
-the motor when time expires.
+another game. A game lasts 60 seconds by default and starts the motor. When
+the game timer expires, a 10-second `chaos` phase randomly switches the motor
+on and off at intervals between 200 and 800 milliseconds, making the ball move
+unpredictably. The motor is always stopped when the chaos phase ends.
 
 Read the current timer state:
 
@@ -64,10 +66,10 @@ Start a game without the controller:
 curl -X POST http://localhost:7777/game/start
 ```
 
-The JSON response includes `state`, `remaining_seconds`, `duration_seconds`,
-and the incrementing `game` number. The periodic service log reports controls,
-motor state, and `/api/countdown` together on one line. Game start and finish
-events are also logged:
+The JSON response includes `state` (`idle`, `running`, `chaos`, or `finished`),
+`remaining_seconds`, `duration_seconds`, and the incrementing `game` number.
+The periodic service log reports controls, motor state, and `/api/countdown`
+together on one line. Game and chaos start/finish events are also logged:
 
 ```bash
 journalctl -u piwebserver -f
