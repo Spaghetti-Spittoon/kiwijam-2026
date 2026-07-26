@@ -78,6 +78,23 @@ journalctl -u piwebserver -f
 Set a different game duration in the systemd service with, for example,
 `Environment=PIWS_GAME_SECONDS=90`, then run `systemctl daemon-reload` and
 restart the service.
+
+## Countdown OLED
+
+The server renders the countdown directly on a 128x64 SSD1315/SSD1306-compatible
+I2C OLED at address `0x3c`. Connect it to the Raspberry Pi 3 with the Pi powered
+off:
+
+- OLED GND to physical pin 6 (GND)
+- OLED VCC to physical pin 1 (3.3 V)
+- OLED SDA to physical pin 3 (GPIO2/SDA1)
+- OLED SCL to physical pin 5 (GPIO3/SCL1)
+
+I2C must be enabled with `dtparam=i2c_arm=on` in `/boot/config.txt`. The display
+shows `READY`, the active game's seconds, the 10-second `CHAOS` phase, and
+`GAME OVER`. It reconnects automatically after an I2C error. Override the
+default bus device with `PIWS_OLED_I2C` if needed.
+
 For a non-root service, add its user to the `dialout` group.
 
 The earlier GPIO PWM transport is no longer used. `dtoverlay=pwm-2chan` and

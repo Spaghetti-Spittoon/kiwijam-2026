@@ -6,6 +6,7 @@ use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
 use gilrs::{Axis, Button, Event, EventType, Gamepad, Gilrs};
 use serde::{Deserialize, Serialize};
 
+mod oled;
 mod uno_serial;
 
 const ENTANGLE: f32 = 0.15;
@@ -747,6 +748,7 @@ async fn main() -> std::io::Result<()> {
     spawn_drift(state.clone());
     spawn_countdown(state.clone());
     spawn_logger(state.clone());
+    oled::spawn(state.clone());
     let pwm_state = state.clone();
     uno_serial::spawn(move || {
         let raw = *pwm_state.controls.lock().unwrap();
