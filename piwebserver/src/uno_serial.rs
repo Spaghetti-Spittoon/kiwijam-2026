@@ -6,6 +6,8 @@ use std::io;
 const SYNC: u8 = 0xA5;
 #[cfg(any(target_os = "linux", test))]
 const PACKET_LEN: usize = 5;
+#[cfg(any(target_os = "linux", test))]
+const SERVO_MAX: i32 = 255;
 
 #[cfg(any(target_os = "linux", test))]
 fn crc8(bytes: &[u8]) -> u8 {
@@ -24,12 +26,17 @@ fn crc8(bytes: &[u8]) -> u8 {
 }
 
 #[cfg(any(target_os = "linux", test))]
+fn inverted_servo_value(value: i32) -> u8 {
+    (SERVO_MAX - value.clamp(0, SERVO_MAX)) as u8
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn packet(sequence: u8, player1: i32, player2: i32) -> [u8; PACKET_LEN] {
     let mut frame = [
         SYNC,
         sequence,
-        player1.clamp(0, 255) as u8,
-        player2.clamp(0, 255) as u8,
+        inverted_servo_value(player1),
+        inverted_servo_value(player2),
         0,
     ];
     frame[PACKET_LEN - 1] = crc8(&frame[..PACKET_LEN - 1]);
@@ -107,13 +114,19 @@ mod tests {
     fn builds_a_valid_packet() {
         let frame = packet(7, 0, 255);
         assert_eq!(frame[0], SYNC);
-        assert_eq!(&frame[1..4], &[7, 0, 255]);
+        assert_eq!(&frame[1..4], &[7, 255, 0]);
         assert_eq!(frame[4], crc8(&frame[..4]));
     }
 
     #[test]
     fn clamps_control_values() {
         let frame = packet(0, -1, 256);
-        assert_eq!(&frame[2..4], &[0, 255]);
+        assert_eq!(&frame[2..4], &[255, 0]);
+    }
+
+    #[test]
+    fn inverts_both_servo_channels_around_centre() {
+        assert_eq!(&packet(0, 64, 192)[2..4], &[191, 63]);
+        assert_eq!(&packet(0, 127, 128)[2..4], &[128, 127]);
     }
 }

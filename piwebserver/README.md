@@ -25,6 +25,10 @@ The default device is `/dev/ttyACM0` at 115200 baud. Every 50 ms the Pi sends:
 0xA5 | sequence | player1 | player2 | CRC-8
 ```
 
+Both transmitted player values are inverted (`servo = 255 - control`) to match
+the mirrored linkage in the physical game. This hardware correction does not
+change `/api/controls` or the OLED Pong directions.
+
 CRC-8 uses polynomial `0x07` over the first four bytes. Opening the serial port
 resets an Uno, so the server waits two seconds for its bootloader. It reconnects
 automatically after unplugging. The Uno returns both servos to centre if valid
