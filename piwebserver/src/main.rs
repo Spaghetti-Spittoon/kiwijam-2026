@@ -19,8 +19,8 @@ const DRIFT_DECAY: f32 = 0.97;
 const DRIFT_TICK_MS: u64 = 120;
 
 const LOG_TICK_MS: u64 = 500;
-const P2_RATE: f32 = 0.04;
-const MOUSE_RATE: f32 = 0.004;
+const P2_RATE: f32 = 0.03;
+const MOUSE_RATE: f32 = 0.00025;
 const CLICK_RATE: f32 = 0.04;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -187,14 +187,21 @@ async fn set_motor(path: web::Path<String>, data: web::Data<AppState>) -> impl R
     }
 }
 
-fn pad_direction(pad: &Gamepad) -> f32 {
-    if pad.is_pressed(Button::DPadLeft) {
-        return -1.0;
+fn input_direction(left: bool, right: bool, axes: [f32; 3]) -> f32 {
+    match (left, right) {
+        (true, false) => return -1.0,
+        (false, true) => return 1.0,
+        (true, true) => return 0.0,
+        (false, false) => {}
     }
-    if pad.is_pressed(Button::DPadRight) {
-        return 1.0;
+
+    // Use whichever supported horizontal axis is being moved the furthest.
+    let mut x = axes[0];
+    for candidate in &axes[1..] {
+        if candidate.abs() > x.abs() {
+            x = *candidate;
+        }
     }
-    let x = pad.value(Axis::LeftStickX) + pad.value(Axis::DPadX);
     if x < -DEADZONE {
         -1.0
     } else if x > DEADZONE {
@@ -202,6 +209,21 @@ fn pad_direction(pad: &Gamepad) -> f32 {
     } else {
         0.0
     }
+}
+
+fn pad_direction(pad: &Gamepad) -> f32 {
+    // This Pi's Xbox driver reports physical X as North and physical B as East.
+    let left = pad.is_pressed(Button::DPadLeft) || pad.is_pressed(Button::North);
+    let right = pad.is_pressed(Button::DPadRight) || pad.is_pressed(Button::East);
+    input_direction(
+        left,
+        right,
+        [
+            pad.value(Axis::LeftStickX),
+            pad.value(Axis::RightStickX),
+            pad.value(Axis::DPadX),
+        ],
+    )
 }
 
 fn spawn_gamepad_reader(state: web::Data<AppState>) {
@@ -515,4 +537,23 @@ async fn main() -> std::io::Result<()> {
     .bind(addr)?
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::input_direction;
+
+    #[test]
+    fn face_buttons_drive_both_directions() {
+        assert_eq!(input_direction(true, false, [0.0; 3]), -1.0);
+        assert_eq!(input_direction(false, true, [0.0; 3]), 1.0);
+        assert_eq!(input_direction(true, true, [0.0; 3]), 0.0);
+    }
+
+    #[test]
+    fn strongest_stick_or_dpad_axis_wins() {
+        assert_eq!(input_direction(false, false, [0.2, -0.8, 0.0]), -1.0);
+        assert_eq!(input_direction(false, false, [0.2, 0.4, 0.9]), 1.0);
+        assert_eq!(input_direction(false, false, [0.01, -0.02, 0.0]), 0.0);
+    }
 }
