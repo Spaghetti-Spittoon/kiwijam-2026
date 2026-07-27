@@ -1,0 +1,4 @@
+[toolchain]
+# AVR has no prebuilt `core`, so we rebuild it via build-std on nightly.
+channel = "nightly"
+components = ["rust-src"]

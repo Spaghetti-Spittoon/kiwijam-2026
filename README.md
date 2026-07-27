@@ -1,5 +1,8 @@
 # kiwijam-2026
 
+
+## Flashing the ESP8266
+
 This project was created by Sam, Charisse, Yousongsun, Amer.
 
 ## Esp32motorball
@@ -82,3 +85,6 @@ or test in a new shell, without logging out
 ```
 newgrp input
 ```
+
+The Raspberry Pi server's two-player USB serial setup and Pi-to-Uno wiring
+are documented in [`piwebserver/README.md`](piwebserver/README.md).

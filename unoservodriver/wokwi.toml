@@ -1,0 +1,4 @@
+[wokwi]
+version = 1
+elf = "target/avr-none/debug/unoservodriver.elf"
+firmware = "target/avr-none/debug/unoservodriver.elf"

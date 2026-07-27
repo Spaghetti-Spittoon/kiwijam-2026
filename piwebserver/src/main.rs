@@ -1,9 +1,13 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
 use gilrs::{Axis, Button, Event, EventType, Gamepad, Gilrs};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+mod oled;
+mod uno_serial;
 
 const ENTANGLE: f32 = 0.15;
 const DEADZONE: f32 = 0.12;
@@ -17,9 +21,15 @@ const DRIFT_DECAY: f32 = 0.97;
 const DRIFT_TICK_MS: u64 = 120;
 
 const LOG_TICK_MS: u64 = 500;
-const P2_RATE: f32 = 0.04;
-const MOUSE_RATE: f32 = 0.004;
-const CLICK_RATE: f32 = 0.04;
+const P2_RATE: f32 = 0.03;
+const MOUSE_RATE: f32 = 0.00025;
+const CLICK_RATE: f32 = 0.03;
+const DEFAULT_GAME_SECONDS: u64 = 60;
+const HARD_PRESS_THRESHOLD: f32 = 0.75;
+const START_HOLD_SECONDS: u64 = 5;
+const CHAOS_SECONDS: u64 = 10;
+const CHAOS_MIN_INTERVAL_MS: u64 = 200;
+const CHAOS_INTERVAL_RANGE_MS: u64 = 601;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MotorAction {
@@ -48,16 +58,60 @@ struct Drift {
     p2: f32,
 }
 
+#[derive(Clone, Copy)]
+struct Countdown {
+    duration_seconds: u64,
+    deadline: Option<Instant>,
+    chaos_deadline: Option<Instant>,
+    game: u64,
+}
+
 struct AppState {
     motor: Mutex<MotorAction>,
     controls: Mutex<Controls>,
     drift: Mutex<Drift>,
+    countdown: Mutex<Countdown>,
     left_held: AtomicBool,
+    right_held: AtomicBool,
 }
 
 #[derive(Deserialize)]
 struct AxisInput {
     x: f32,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct CountdownStatus {
+    state: &'static str,
+    remaining_seconds: u64,
+    duration_seconds: u64,
+    game: u64,
+}
+
+#[derive(Default)]
+struct HoldToStart {
+    pressed_since: Option<Instant>,
+    triggered: bool,
+}
+
+impl HoldToStart {
+    fn update(&mut self, pressed: bool, now: Instant) -> bool {
+        if !pressed {
+            self.pressed_since = None;
+            self.triggered = false;
+            return false;
+        }
+
+        let pressed_since = self.pressed_since.get_or_insert(now);
+        if !self.triggered
+            && now.saturating_duration_since(*pressed_since)
+                >= Duration::from_secs(START_HOLD_SECONDS)
+        {
+            self.triggered = true;
+            return true;
+        }
+        false
+    }
 }
 
 fn clamp_axis(v: f32) -> f32 {
@@ -70,6 +124,63 @@ fn to_value(x: f32) -> f32 {
 
 fn clamp_value(v: f32) -> i32 {
     v.clamp(0.0, 255.0).round() as i32
+}
+
+fn seconds_remaining(deadline: Instant, now: Instant) -> u64 {
+    let remaining = deadline.saturating_duration_since(now);
+    (remaining.as_millis() as u64).div_ceil(1000)
+}
+
+fn countdown_status(countdown: Countdown, now: Instant) -> CountdownStatus {
+    if let Some(deadline) = countdown.deadline.filter(|deadline| *deadline > now) {
+        CountdownStatus {
+            state: "running",
+            remaining_seconds: seconds_remaining(deadline, now),
+            duration_seconds: countdown.duration_seconds,
+            game: countdown.game,
+        }
+    } else if let Some(deadline) = countdown.chaos_deadline.filter(|deadline| *deadline > now) {
+        CountdownStatus {
+            state: "chaos",
+            remaining_seconds: seconds_remaining(deadline, now),
+            duration_seconds: countdown.duration_seconds,
+            game: countdown.game,
+        }
+    } else if countdown.game > 0 {
+        CountdownStatus {
+            state: "finished",
+            remaining_seconds: 0,
+            duration_seconds: countdown.duration_seconds,
+            game: countdown.game,
+        }
+    } else {
+        CountdownStatus {
+            state: "idle",
+            remaining_seconds: 0,
+            duration_seconds: countdown.duration_seconds,
+            game: 0,
+        }
+    }
+}
+
+fn current_countdown(state: &AppState) -> CountdownStatus {
+    countdown_status(*state.countdown.lock().unwrap(), Instant::now())
+}
+
+fn start_game(state: &AppState, source: &str) -> CountdownStatus {
+    let status = {
+        let mut countdown = state.countdown.lock().unwrap();
+        countdown.game = countdown.game.saturating_add(1);
+        countdown.deadline = Some(Instant::now() + Duration::from_secs(countdown.duration_seconds));
+        countdown.chaos_deadline = None;
+        countdown_status(*countdown, Instant::now())
+    };
+    *state.motor.lock().unwrap() = MotorAction::Start;
+    println!(
+        "countdown: game {} started by {}; {} seconds; motor started",
+        status.game, source, status.duration_seconds
+    );
+    status
 }
 
 fn entangled(raw: Controls, drift: Drift) -> (i32, i32) {
@@ -104,6 +215,18 @@ impl Rng {
     fn signed_unit(&mut self) -> f32 {
         let u = (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32;
         u * 2.0 - 1.0
+    }
+}
+
+fn next_chaos_interval(rng: &mut Rng) -> Duration {
+    Duration::from_millis(CHAOS_MIN_INTERVAL_MS + rng.next_u64() % CHAOS_INTERVAL_RANGE_MS)
+}
+
+fn random_motor_action(rng: &mut Rng) -> MotorAction {
+    if rng.next_u64() & 1 == 0 {
+        MotorAction::Stop
+    } else {
+        MotorAction::Start
     }
 }
 
@@ -169,6 +292,16 @@ async fn api_motor(data: web::Data<AppState>) -> impl Responder {
     plain(action.as_num().to_string())
 }
 
+#[get("/api/countdown")]
+async fn api_countdown(data: web::Data<AppState>) -> impl Responder {
+    web::Json(current_countdown(data.get_ref()))
+}
+
+#[post("/game/start")]
+async fn api_start_game(data: web::Data<AppState>) -> impl Responder {
+    web::Json(start_game(data.get_ref(), "HTTP"))
+}
+
 #[post("/motor/{action}")]
 async fn set_motor(path: web::Path<String>, data: web::Data<AppState>) -> impl Responder {
     let new = match path.into_inner().as_str() {
@@ -185,14 +318,21 @@ async fn set_motor(path: web::Path<String>, data: web::Data<AppState>) -> impl R
     }
 }
 
-fn pad_direction(pad: &Gamepad) -> f32 {
-    if pad.is_pressed(Button::DPadLeft) {
-        return -1.0;
+fn input_direction(left: bool, right: bool, axes: [f32; 3]) -> f32 {
+    match (left, right) {
+        (true, false) => return -1.0,
+        (false, true) => return 1.0,
+        (true, true) => return 0.0,
+        (false, false) => {}
     }
-    if pad.is_pressed(Button::DPadRight) {
-        return 1.0;
+
+    // Use whichever supported horizontal axis is being moved the furthest.
+    let mut x = axes[0];
+    for candidate in &axes[1..] {
+        if candidate.abs() > x.abs() {
+            x = *candidate;
+        }
     }
-    let x = pad.value(Axis::LeftStickX) + pad.value(Axis::DPadX);
     if x < -DEADZONE {
         -1.0
     } else if x > DEADZONE {
@@ -200,6 +340,34 @@ fn pad_direction(pad: &Gamepad) -> f32 {
     } else {
         0.0
     }
+}
+
+fn mouse_button_direction(left: bool, right: bool) -> f32 {
+    match (left, right) {
+        (true, false) => -1.0,
+        (false, true) => 1.0,
+        _ => 0.0,
+    }
+}
+
+fn hard_pressed(pad: &Gamepad, button: Button) -> bool {
+    pad.button_data(button)
+        .is_some_and(|data| data.value() >= HARD_PRESS_THRESHOLD)
+}
+
+fn pad_direction(pad: &Gamepad) -> f32 {
+    // This Pi's Xbox driver reports physical X as North and physical B as East.
+    let left = pad.is_pressed(Button::DPadLeft) || pad.is_pressed(Button::North);
+    let right = pad.is_pressed(Button::DPadRight) || pad.is_pressed(Button::East);
+    input_direction(
+        left,
+        right,
+        [
+            pad.value(Axis::LeftStickX),
+            pad.value(Axis::RightStickX),
+            pad.value(Axis::DPadX),
+        ],
+    )
 }
 
 fn spawn_gamepad_reader(state: web::Data<AppState>) {
@@ -212,6 +380,7 @@ fn spawn_gamepad_reader(state: web::Data<AppState>) {
             }
         };
         eprintln!("gamepad: reader started (waiting for a controller)");
+        let mut west_hold = HoldToStart::default();
         loop {
             let mut drained = 0;
             while let Some(Event { id, event, .. }) = gilrs.next_event() {
@@ -237,11 +406,18 @@ fn spawn_gamepad_reader(state: web::Data<AppState>) {
 
             let pads: Vec<_> = gilrs.gamepads().collect();
             if let Some((_, pad0)) = pads.first() {
+                let west_is_hard = hard_pressed(pad0, Button::West);
+                if west_hold.update(west_is_hard, Instant::now()) {
+                    start_game(state.get_ref(), "controller West/Y five-second hold");
+                }
+
                 let dir = pad_direction(pad0);
                 if dir != 0.0 {
                     let mut c = state.controls.lock().unwrap();
                     c.p2 = (c.p2 + dir * P2_RATE).clamp(-1.0, 1.0);
                 }
+            } else {
+                west_hold.update(false, Instant::now());
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -387,6 +563,13 @@ fn spawn_mouse_reader(state: web::Data<AppState>) {
                                         println!("mouse left button: {}", ev.value() != 0);
                                     }
                                 }
+                                EvType::KEY if ev.code() == evdev::Key::BTN_RIGHT.0 => {
+                                    state.right_held.store(ev.value() != 0, Ordering::Relaxed);
+
+                                    if debug {
+                                        println!("mouse right button: {}", ev.value() != 0);
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -412,6 +595,7 @@ fn spawn_mouse_reader(state: web::Data<AppState>) {
         use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
         use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
         const VK_LBUTTON: i32 = 0x01;
+        const VK_RBUTTON: i32 = 0x02;
         eprintln!("mouse: polling cursor position");
         let mut last: Option<i32> = None;
         loop {
@@ -422,8 +606,10 @@ fn spawn_mouse_reader(state: web::Data<AppState>) {
                 }
                 last = Some(p.x);
             }
-            let held = (unsafe { GetAsyncKeyState(VK_LBUTTON) } as u16 & 0x8000) != 0;
-            state.left_held.store(held, Ordering::Relaxed);
+            let left = (unsafe { GetAsyncKeyState(VK_LBUTTON) } as u16 & 0x8000) != 0;
+            let right = (unsafe { GetAsyncKeyState(VK_RBUTTON) } as u16 & 0x8000) != 0;
+            state.left_held.store(left, Ordering::Relaxed);
+            state.right_held.store(right, Ordering::Relaxed);
             std::thread::sleep(std::time::Duration::from_millis(8));
         }
     });
@@ -437,11 +623,70 @@ fn spawn_mouse_reader(_state: web::Data<AppState>) {
 fn spawn_mouse_button_ramp(state: web::Data<AppState>) {
     std::thread::spawn(move || {
         loop {
-            if state.left_held.load(Ordering::Relaxed) {
+            let direction = mouse_button_direction(
+                state.left_held.load(Ordering::Relaxed),
+                state.right_held.load(Ordering::Relaxed),
+            );
+            if direction != 0.0 {
                 let mut c = state.controls.lock().unwrap();
-                c.p1 = (c.p1 - CLICK_RATE).clamp(-1.0, 1.0);
+                c.p1 = (c.p1 + direction * CLICK_RATE).clamp(-1.0, 1.0);
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
+}
+
+fn spawn_countdown(state: web::Data<AppState>) {
+    std::thread::spawn(move || {
+        enum Update {
+            None,
+            StartChaos(u64),
+            ChangeMotor,
+            FinishChaos(u64),
+        }
+
+        let mut rng = Rng::from_time();
+        let mut next_motor_change = Instant::now();
+        loop {
+            let now = Instant::now();
+            let update = {
+                let mut countdown = state.countdown.lock().unwrap();
+                if countdown.deadline.is_some_and(|deadline| deadline <= now) {
+                    countdown.deadline = None;
+                    countdown.chaos_deadline = Some(now + Duration::from_secs(CHAOS_SECONDS));
+                    Update::StartChaos(countdown.game)
+                } else if countdown
+                    .chaos_deadline
+                    .is_some_and(|deadline| deadline <= now)
+                {
+                    countdown.chaos_deadline = None;
+                    Update::FinishChaos(countdown.game)
+                } else if countdown.chaos_deadline.is_some() && now >= next_motor_change {
+                    Update::ChangeMotor
+                } else {
+                    Update::None
+                }
+            };
+
+            match update {
+                Update::StartChaos(game) => {
+                    let motor = random_motor_action(&mut rng);
+                    *state.motor.lock().unwrap() = motor;
+                    next_motor_change = now + next_chaos_interval(&mut rng);
+                    println!("countdown: game {game} ended; starting {CHAOS_SECONDS}s chaos phase");
+                }
+                Update::ChangeMotor => {
+                    *state.motor.lock().unwrap() = random_motor_action(&mut rng);
+                    next_motor_change = now + next_chaos_interval(&mut rng);
+                }
+                Update::FinishChaos(game) => {
+                    *state.motor.lock().unwrap() = MotorAction::Stop;
+                    println!("countdown: game {game} chaos finished; motor stopped");
+                }
+                Update::None => {}
+            }
+
+            std::thread::sleep(Duration::from_millis(100));
         }
     });
 }
@@ -455,7 +700,12 @@ fn spawn_logger(state: web::Data<AppState>) {
                 entangled(raw, drift)
             };
             let m = state.motor.lock().unwrap().as_num();
-            println!("/api/controls: {n1},{n2} /api/motor: {m}");
+            let countdown = current_countdown(state.get_ref());
+            println!(
+                "/api/controls: {n1},{n2} /api/motor: {m} \
+                 /api/countdown: {},{}s,game={}",
+                countdown.state, countdown.remaining_seconds, countdown.game
+            );
             std::thread::sleep(std::time::Duration::from_millis(LOG_TICK_MS));
         }
     });
@@ -465,25 +715,46 @@ fn spawn_logger(state: web::Data<AppState>) {
 async fn index() -> impl Responder {
     plain(
         "piwebserver (motorball) — P1=mouse, P2=controller (read device-side)\n\
-         GET /api/controls -> n1,n2 (0..255, 128=centre)   GET /api/motor -> 0|1\n"
+         GET /api/controls -> n1,n2 (0..255, 128=centre)   GET /api/motor -> 0|1\n\
+         GET /api/countdown -> game timer JSON   POST /game/start -> start/restart game\n"
             .to_string(),
     )
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    let game_seconds = std::env::var("PIWS_GAME_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT_GAME_SECONDS);
     let state = web::Data::new(AppState {
         motor: Mutex::new(MotorAction::Stop),
         controls: Mutex::new(Controls { p1: 0.0, p2: 0.0 }),
         drift: Mutex::new(Drift::default()),
+        countdown: Mutex::new(Countdown {
+            duration_seconds: game_seconds,
+            deadline: None,
+            chaos_deadline: None,
+            game: 0,
+        }),
         left_held: AtomicBool::new(false),
+        right_held: AtomicBool::new(false),
     });
 
     spawn_mouse_reader(state.clone());
     spawn_mouse_button_ramp(state.clone());
     spawn_gamepad_reader(state.clone());
     spawn_drift(state.clone());
+    spawn_countdown(state.clone());
     spawn_logger(state.clone());
+    oled::spawn(state.clone());
+    let pwm_state = state.clone();
+    uno_serial::spawn(move || {
+        let raw = *pwm_state.controls.lock().unwrap();
+        let drift = *pwm_state.drift.lock().unwrap();
+        entangled(raw, drift)
+    })?;
 
     let addr = ("0.0.0.0", 7777);
     println!(
@@ -494,6 +765,10 @@ async fn main() -> std::io::Result<()> {
         "             motor (0|1)      http://localhost:{}/api/motor",
         addr.1
     );
+    println!(
+        "         countdown (JSON)      http://localhost:{}/api/countdown ({}s rounds)",
+        addr.1, game_seconds
+    );
 
     HttpServer::new(move || {
         App::new()
@@ -502,9 +777,91 @@ async fn main() -> std::io::Result<()> {
             .service(set_input)
             .service(api_controls)
             .service(api_motor)
+            .service(api_countdown)
+            .service(api_start_game)
             .service(set_motor)
     })
     .bind(addr)?
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{
+        Countdown, HoldToStart, countdown_status, input_direction, mouse_button_direction,
+        seconds_remaining,
+    };
+
+    #[test]
+    fn face_buttons_drive_both_directions() {
+        assert_eq!(input_direction(true, false, [0.0; 3]), -1.0);
+        assert_eq!(input_direction(false, true, [0.0; 3]), 1.0);
+        assert_eq!(input_direction(true, true, [0.0; 3]), 0.0);
+    }
+
+    #[test]
+    fn strongest_stick_or_dpad_axis_wins() {
+        assert_eq!(input_direction(false, false, [0.2, -0.8, 0.0]), -1.0);
+        assert_eq!(input_direction(false, false, [0.2, 0.4, 0.9]), 1.0);
+        assert_eq!(input_direction(false, false, [0.01, -0.02, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn mouse_buttons_drive_opposite_directions() {
+        assert_eq!(mouse_button_direction(true, false), -1.0);
+        assert_eq!(mouse_button_direction(false, true), 1.0);
+        assert_eq!(mouse_button_direction(true, true), 0.0);
+        assert_eq!(mouse_button_direction(false, false), 0.0);
+    }
+
+    #[test]
+    fn countdown_rounds_partial_seconds_up_for_display() {
+        let now = Instant::now();
+        assert_eq!(seconds_remaining(now + Duration::from_millis(1001), now), 2);
+        assert_eq!(seconds_remaining(now + Duration::from_secs(1), now), 1);
+        assert_eq!(seconds_remaining(now, now), 0);
+    }
+
+    #[test]
+    fn countdown_reports_idle_running_and_finished() {
+        let now = Instant::now();
+        let mut countdown = Countdown {
+            duration_seconds: 60,
+            deadline: None,
+            chaos_deadline: None,
+            game: 0,
+        };
+        assert_eq!(countdown_status(countdown, now).state, "idle");
+
+        countdown.game = 1;
+        countdown.deadline = Some(now + Duration::from_secs(30));
+        assert_eq!(countdown_status(countdown, now).state, "running");
+        assert_eq!(countdown_status(countdown, now).remaining_seconds, 30);
+
+        countdown.deadline = None;
+        countdown.chaos_deadline = Some(now + Duration::from_secs(10));
+        assert_eq!(countdown_status(countdown, now).state, "chaos");
+        assert_eq!(countdown_status(countdown, now).remaining_seconds, 10);
+
+        countdown.chaos_deadline = None;
+        assert_eq!(countdown_status(countdown, now).state, "finished");
+    }
+
+    #[test]
+    fn west_button_requires_a_five_second_hold_and_release() {
+        let now = Instant::now();
+        let mut hold = HoldToStart::default();
+
+        assert!(!hold.update(true, now));
+        assert!(!hold.update(true, now + Duration::from_millis(4999)));
+        assert!(hold.update(true, now + Duration::from_secs(5)));
+        assert!(!hold.update(true, now + Duration::from_secs(10)));
+
+        assert!(!hold.update(false, now + Duration::from_secs(11)));
+        assert!(!hold.update(true, now + Duration::from_secs(12)));
+        assert!(hold.update(true, now + Duration::from_secs(17)));
+    }
 }

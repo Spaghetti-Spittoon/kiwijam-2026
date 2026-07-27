@@ -1,0 +1,17 @@
+[Unit]
+Description=Kiwijam motorball control web server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/piwebserver/piwebserver
+# Run as root so the process can read the controller/mouse at /dev/input/*.
+User=root
+Restart=always
+RestartSec=2
+# Give the socket a moment on reboots before the network is fully up.
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
