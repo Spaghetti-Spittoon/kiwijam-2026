@@ -3,16 +3,19 @@ use embassy_executor::Spawner;
 use embassy_net::dns::DnsSocket;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_net::{Runner, StackResources};
+use embassy_time::{Duration, Timer};
 use esp_println::println;
 use esp_radio::wifi::{
     sta::StationConfig, AuthenticationMethod, Config as WifiConfig, ControllerConfig, Interface,
-    WifiController,
+    PowerSaveMode, WifiController,
 };
 use reqwless::client::HttpClient;
 use static_cell::StaticCell;
 
 const SSID: &str = env!("WIFI_SSID");
 const PASSWORD: &str = env!("WIFI_PASSWORD");
+
+const TX_POWER_QUARTER_DBM: i8 = 44;
 
 pub type EspTcpClient = TcpClient<'static, 1, 1500, 1500>;
 pub type EspDnsSocket = DnsSocket<'static>;
@@ -37,6 +40,26 @@ pub struct ConnectionControls {
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, Interface>) -> ! {
     runner.run().await
+}
+
+#[embassy_executor::task]
+async fn wifi_task(controller: &'static mut WifiController<'static>) -> ! {
+    loop {
+        let _ = controller.wait_for_disconnect_async().await;
+        println!("wifi disconnected, reconnecting");
+        loop {
+            match controller.connect_async().await {
+                Ok(info) => {
+                    println!("wifi reconnected: {info:?}");
+                    break;
+                }
+                Err(e) => {
+                    println!("wifi reconnect failed: {e:?}");
+                    Timer::after(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
 }
 
 pub async fn connect_wifi(
@@ -77,6 +100,13 @@ pub async fn connect_wifi(
         }
     };
 
+    if let Err(e) = controller.set_power_saving(PowerSaveMode::Maximum) {
+        println!("failed to set wifi power save: {e:?}");
+    }
+    if let Err(e) = controller.set_max_tx_power(TX_POWER_QUARTER_DBM) {
+        println!("failed to cap wifi tx power: {e:?}");
+    }
+
     println!("Wifi configured");
 
     match controller.connect_async().await {
@@ -112,6 +142,11 @@ pub async fn connect_wifi(
                 },
             );
         }
+    }
+
+    match wifi_task(controller) {
+        Ok(token) => spawner.spawn(token),
+        Err(e) => println!("failed to spawn wifi_task: {e:?}"),
     }
 
     println!("waiting for network stack");
